@@ -3,8 +3,10 @@ a piece of uranus
 
 ## Dependency
 Make sure https://github.com/ziwei-yang/aphrodite in the same parent directory.
+```
 Proj/aphrodite
 Proj/ceres
+```
 
 ## Preparation:
 rvm install 2.6
