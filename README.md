@@ -9,8 +9,10 @@ Proj/ceres
 ```
 
 ## Preparation:
+```
 rvm install 2.6
 bundle install
+```
 
 ## Data:
 ```
