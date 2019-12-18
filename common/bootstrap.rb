@@ -11,7 +11,6 @@ require 'openssl'
 require 'http'
 require 'ecdsa'
 require 'oj' if RUBY_ENGINE == 'ruby'
-require 'concurrent'
 require 'securerandom'
 
 module URN
@@ -164,13 +163,15 @@ module URN
 		def order_alive_int?(t)
 			return false if t['remained'] == 0
 			return false if t['status'].nil?
-			return true if t['status'] == 'canceling'
 			alive = ORD_NON_ALIVE_STATUS.include?(t['status'].downcase) == false
 			t['_alive'] = alive
 			alive
 		end
 		def order_canceling?(t)
-			return t['status'] == 'canceling'
+			t['status'] == 'canceling'
+		end
+		def order_pending?(t)
+			t['status'] == 'pending'
 		end
 		def order_set_dead(order)
 			return unless order_alive?(order)
@@ -248,6 +249,10 @@ module URN
 			raise "Order are not same one:\n#{format_trade(o1)}\n#{format_order(o2)}" unless order_same?(o1, o2)
 			case [order_alive?(o1), order_alive?(o2)]
 			when [true, true]
+				# Better replace if status: 'pending' -> 'new'
+				if order_pending?(o1) && o1['executed'] <= o2['executed']
+					return true
+				end
 				return o1['executed'] < o2['executed']
 			when [true, false]
 				return true
@@ -621,14 +626,14 @@ unless defined? URN::BOOTSTRAP_LOAD_STARTED
 	require_relative './mkt'
 	Dir["#{File.dirname(__FILE__)}/*.rb"].each do |f|
 		next if File.basename(f).include?('legacy')
-		# puts "loading #{File.basename(f)}"
+		# puts "loading #{f}"
 		require_relative "./#{File.basename(f)}"
 	end
 	URN::ROOT = File.dirname(__FILE__) + '/../'
-	URN::BOOTSTRAP_LOAD = true
 	URN::API_PROXY = (ENV['API_PROXY'] || 'default').
 		split(',').
 		map { |str| str=='default'?nil:str }
 	# will create as many threads as necessary for work posted to it
 	URN::CachedThreadPool = Concurrent::CachedThreadPool.new
+	URN::BOOTSTRAP_LOAD = true
 end

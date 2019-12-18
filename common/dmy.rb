@@ -15,6 +15,7 @@ module URN
 			@last_operation_time = 0
 			@verbose = opt[:verbose] == true
 			@debug = opt[:debug] == true
+			@listener_mgr = opt[:mgr]
 		end
 		def given_name
 			@name
@@ -106,6 +107,7 @@ module URN
 			end
 			@dead_orders.push trade
  			puts "XX Order Canceled:\n#{format_trade(trade)}" if @verbose
+			@listener_mgr.notify_order_canceled(trade)
 			trade
 		end
 
@@ -173,6 +175,7 @@ module URN
 				o['remained'] = 0.0
 				order_status_evaluate(o)
 				filled_orders.push(o)
+				@listener_mgr.notify_order_filled(o)
 			end
 			if @verbose
 				filled_orders.each do |o|
@@ -223,11 +226,21 @@ module URN
 			client = DummyMarketClient.new(
 				market,
 				verbose:@verbose,
-				debug:@debug
+				debug:@debug,
+				mgr:self # For receiving order updates.
 			)
 			client_register client
 			return client
 		end
+
+		def notify_order_filled(new_o)
+			@listeners.each { |l| l.on_order_update(new_o) }
+		end
+
+		def notify_order_canceled(new_o)
+			@listeners.each { |l| l.on_order_update(new_o) }
+		end
+
 		def balance_all(opt={})
 			puts "Do nothing in balance_all()"
 		end

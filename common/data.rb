@@ -88,10 +88,7 @@ module URN
 						cache: @market_status_cache
 					)
 					cost_t = (Time.now.to_f - start_t)*1000
-					@_stat_line = [
-						"\r",
-						'read', cost_t.round(4).to_s.ljust(6)
-					]
+					@_stat_line = [ 'read', cost_t.round(3).to_s.ljust(6) ]
 					next unless data_chg
 					buffer = @redis_odbk_buffer
 					# Stack data to unprocessed history
@@ -115,7 +112,7 @@ module URN
 					loop do
 						if @redis_odbk_chg
 							work_cycle()
-							print "\r#{@wait_chars[@wait_ct % @wait_chars.size]}"
+							print "\r#{@wait_chars[@wait_ct % @wait_chars.size]}" unless @verbose
 							@wait_ct += 1
 						else
 							sleep()
@@ -125,6 +122,7 @@ module URN
 					APD::Logger.error e
 				end
 			end
+			work_thread.priority = 99
 			_listen_redis(work_thread)
 		end
 		def work_cycle # call _work_cycle_int() with timing
@@ -135,7 +133,7 @@ module URN
 			if @market_snapshot.empty?
 				if @verbose
 					@_stat_line += ['func', cost_t.round(3).to_s.ljusy(5)]
-					print "#{@_stat_line.join(' ')}    "
+					puts "#{@_stat_line.join(' ')}    ", nohead:true, inline:true, nofile:true
 				end
 			else
 				bids, asks, t, mkt_t = @market_snapshot[@markets[0]][:orderbook]
@@ -144,10 +142,10 @@ module URN
 				if @verbose
 					@_stat_line += [
 						'work', cost_t.round(3).to_s.ljust(5),
-						'latency', local_time_diff.round(3).to_s.ljust(5), mkt_time_diff.round(3).to_s.ljust(6)
+						'latency', local_time_diff.round(3).to_s.ljust(6), mkt_time_diff.round(3).to_s.ljust(6)
 					]
 					@_stat_line += (@algos || []).map { |alg| alg._stat_line }
-					print "#{@_stat_line.join(' ')}    "
+					puts "#{@_stat_line.join(' ')}    ", nohead:true, inline:true, nofile:true
 				end
 			end
 		end
@@ -322,7 +320,7 @@ module URN
 				end
 				ct += 1
 # 				break if ct == 50 # Fast test
-# 				break if ct == 500_000 # Fast test
+#  				break if ct == 5_000 # Fast test
 				_run_historical_files()
 			end
 			end_t = Time.now.to_f
@@ -357,6 +355,6 @@ if __FILE__ == $0 && defined? URN::BOOTSTRAP_LOAD
 	puts "Run MktDataSource"
 	mds = URN::MktDataSource.new({
 		'Bybit' => 'USD-BTC@P'
-	}, debug:true)
+	}, verbose:true, debug:true)
 	mds.start
 end

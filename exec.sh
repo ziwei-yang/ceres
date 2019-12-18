@@ -18,12 +18,14 @@ if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'fix_state.rb' ] || \
 	[ $basename == 'save_mkt.rb' ] || \
 	[ $basename == 'filter.rb' ] || \
-	[ $basename == 'test.rb' ]
+	[ $basename == 'test.rb' ] || \
+	[ $basename == 't.rb' ]
 then
 	source $DIR/conf/dummy_env.sh
 	source $DIR/conf/env.sh
 elif [ $basename == 'dmy.rb' ] || \
 	[ $basename == 'data.rb' ] || \
+	[ $basename == 'phob.rb' ] || \
 	[ $basename == 'mars.rb' ]
 then
 	if [[ $@ == *live* ]]; then

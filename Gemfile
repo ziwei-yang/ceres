@@ -4,11 +4,6 @@ source 'https://rubygems.org'
 gemfile = "#{File.dirname(__FILE__)}/../aphrodite/Gemfile"
 eval(IO.read(gemfile), binding)
 
-gem 'concurrent-ruby', require: 'concurrent'
-# Potential performance improvements may be achieved under MRI 
-# by installing optional C extensions.
-gem 'concurrent-ruby-ext' if RUBY_ENGINE == 'ruby'
-
 gem 'parallel'
 gem 'gli'
 gem 'ecdsa'

@@ -989,23 +989,29 @@ module URN
 	end
 
 	# Multi-Market functional methods with asynchronised features.
+	# Use Concurrent Classes for multi-thread cases.
 	class StandardMarketManager
 		include URN::AssetManager
 		include APD::LockUtil
 		def initialize(markets, listeners=[])
 			@listeners = listeners
-			@alive_orders = {}
-			@dead_orders = {}
+			@alive_orders = Concurrent::Hash.new
+			@dead_orders = Concurrent::Hash.new
 
-			@cancel_jobs = {}
+			@cancel_jobs = Concurrent::Hash.new
 
+			@_oms_broadcast_channels = {}
 			markets.each do |mkt|
-				@alive_orders[mkt] ||= {}
-				@dead_orders[mkt] ||= {}
-				@cancel_jobs[mkt] ||= {}
+				@alive_orders[mkt] ||= Concurrent::Hash.new
+				@dead_orders[mkt] ||= Concurrent::Hash.new
+				@cancel_jobs[mkt] ||= Concurrent::Hash.new
+				# oms.js : `URANUS:${exchange}:${account}:O_channel`;
+				@_oms_broadcast_channels["URANUS:#{mkt}:-:O_channel"] = mkt
 			end
 
 			@refresh_thread = Thread.new { refresh_alive_orders() }
+			@redis_listening_thread = Thread.new { _listen_oms_to_refresh() }
+			@redis_listening_thread.priority = -99
 			@maintain_thread = Thread.new { maintain_jobs() }
 
 			puts "#{self.class} init with markets: #{markets}"
@@ -1038,6 +1044,10 @@ module URN
 			trade
 		end
 
+		def place_order_async(o, listener, order_cache, opt={})
+			market_client(o).place_order_async(o, listener, order_cache, opt)
+		end
+
 		# Algo should not be blocked here.
 		def cancel_order(pair, trade)
 			raise "Not implemented, should call cancel_order_async()"
@@ -1052,24 +1062,40 @@ module URN
 				trade.each { |t| cancel_order_async(t, opt) }
 				return
 			end
-			if order_alive?(trade) == false
-				monitor_order(trade)
+
+			monitor_order(trade)
+			return if order_alive?(trade) == false
+			return if order_canceling?(trade)
+
+			mkt = trade['market']
+			i = trade['i']
+			if @dead_orders[mkt][i] != nil
+				# Order in record is dead already?
+				puts "@cancel_jobs[#{mkt}][#{i}] dismissed, order is dead already."
 				return
 			end
 
 			trade = trade.clone # Clone this to avoid data overwritten in thread.
 
-			mkt = trade['market']
-			i = trade['i']
-			if order_canceling?(trade)
-				monitor_order(trade)
+			# Stop to cancel order twice.
+			# When jobs is a future, stop doing.
+			# When jobs is :pending_spawn, stop doing.
+			# When jobs is :completed or :rejected, could cancel it again
+			if @cancel_jobs[mkt][i].is_a?(Symbol)
+				if @cancel_jobs[mkt][i] == :pending_spawn
+					puts "@cancel_jobs[#{mkt}][#{i}] is :pending_spawn already"
+					return
+				elsif @cancel_jobs[mkt][i] == :completed
+					puts "@cancel_jobs[#{mkt}][#{i}] is :completed already"
+					return
+				end
+			elsif @cancel_jobs[mkt][i] != nil # Must be Future now
+				puts "@cancel_jobs[#{mkt}][#{i}] is running already"
 				return
 			end
+			@cancel_jobs[mkt][i] = :pending_spawn
 
-			# Stop to cancel order twice.
-			return unless @cancel_jobs[mkt][i].nil?
-
-			puts "Async cancel #{format_trade(trade)}"
+			puts "@cancel_jobs[#{mkt}][#{i}] spawning"
 
 			@alive_orders[mkt][i] = trade
 			future = Concurrent::Future.execute(executor: URN::CachedThreadPool) {
@@ -1084,19 +1110,12 @@ module URN
 			new_o = new_o.clone
 			mkt, i = new_o['market'], new_o['i']
 			# Get order form snapshot
-			o = @alive_orders.dig(mkt, i)
-			if o.nil?
-				o = @dead_orders.dig(mkt, i)
-				raise "Order #{new_o} is not under managed" if o.nil?
-				# o is not alive any more, only accept new_o as dead order.
-				if order_alive?(new_o)
-					puts "Skip update dead order with alive data:\n#{format_trade(o)}\n#{format_trade(new_o)}"
-					return
-				end
-			end
+			o = @alive_orders.dig(mkt, i) ||
+				@dead_orders.dig(mkt, i) ||
+				raise("Order #{new_o} is not under managed")
 			# Apply new_o only reasonable. Maybe new_o is not newer.
 			return unless order_should_update?(o, new_o)
-			puts "Order update:\n#{format_trade(o)}\n#{format_trade(new_o)}"
+			# puts "Order update:\n#{format_trade(o)}\n#{format_trade(new_o)}"
 			# Organize new order by status.
 			if order_alive?(new_o)
 				@alive_orders[mkt][i] = new_o
@@ -1125,9 +1144,30 @@ module URN
 						on_order_update(new_o)
 					end
 				end
-				sleep 0.001
+				sleep 1
 			end
-			raise "#{self.class.name()} maintain_jobs() quit"
+			raise "#{self.class.name()} refresh_alive_orders() quit"
+		end
+
+		def _listen_oms_to_refresh
+			redis_new.subscribe(*(@_oms_broadcast_channels.keys)) do |on|
+				on.subscribe { |chn, num| puts "Subscribed to #{chn} (#{num} subscriptions)" }
+				on.message do |chn, msg|
+					mkt = @_oms_broadcast_channels[chn]
+					# msg is changed order id array, splited by space
+					msg.split(' ').each do |i|
+						o = @alive_orders.dig(mkt, i)
+						next if o.nil?
+						puts "<< OMS/B #{mkt} #{i}"
+						new_o = market_client(mkt).query_order(o['pair'], o, allow_fail:true)
+						next if new_o.nil?
+						# check if status changed?
+						next unless order_changed?(o, new_o)
+						on_order_update(new_o)
+					end
+				end
+				on.unsubscribe { |chn, num| raise "Unsubscribed to ##{chn} (#{num} subscriptions)" }
+			end
 		end
 
 		# Should run separately.
@@ -1136,15 +1176,18 @@ module URN
 				@cancel_jobs.keys.each do |mkt|
 					@cancel_jobs[mkt].keys.each do |i|
 						future = @cancel_jobs.dig(mkt, i)
-						next if future.nil?
-						@cancel_jobs[mkt].delete(i) if future.complete?
+						next if future.is_a?(Symbol) # pending_spawn rejected completed
 						if future.rejected? # Log reason.
+							@cancel_jobs[mkt][i] = :rejected
 							puts "@cancel_jobs[#{mkt}][#{i}] failed"
 							APD::Logger.error future.reason
+						else
+							@cancel_jobs[mkt][i] = :completed
+							puts "@cancel_jobs[#{mkt}][#{i}] finished"
 						end
 					end
 				end
-				sleep 0.001
+				sleep 1
 			end
 			raise "#{self.class.name()} maintain_jobs() quit"
 		end
@@ -2108,6 +2151,32 @@ module URN
 			order
 		end
 
+		# This method would return nothing
+		# And keep order under managed in cache.
+		def place_order_async(order, listener, order_cache, opt={})
+			opt = opt.clone
+			if opt[:client_oid].nil?
+				order['client_oid'] = client_oid = generate_clientoid(order['pair'])
+			else
+				order['client_oid'] = client_oid = opt[:client_oid]
+			end
+			# Make sure to put order under managed before future is created.
+			order_cache[client_oid] = order
+			puts "place_order_async [#{order['market']}] [#{client_oid}] spawning\n#{format_trade(order)}"
+			future = Concurrent::Future.execute(executor: URN::CachedThreadPool) {
+				begin
+					trade = place_order(order['pair'], order, opt)
+					if trade.nil?
+						listener.on_place_order_rejected(client_oid)
+					else
+						listener.on_place_order_done(client_oid, trade)
+					end
+				rescue => e
+					listener.on_place_order_rejected(client_oid, e)
+				end
+			}
+		end
+
 		# For OMS only, might be extended into market clients.
 		def account_name
 			'-' # Default account in OMS is '-'.
@@ -2907,7 +2976,7 @@ module URN
 
 		include URN::CLI
 		def run_cli(pair=nil)
-			puts "Trade mode switched to ab3"
+			puts "Trade mode switched to ab3, #{ARGV}"
 			@trade_mode = 'ab3'
 			if ARGV.empty?
 				return
