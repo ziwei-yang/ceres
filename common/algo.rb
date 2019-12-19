@@ -47,6 +47,17 @@ module URN
 			@market_pairs.each { |m, p| @canceling_orders[m] ||= Concurrent::Hash.new }
 
 			@min_valid_odbk_depth = 10 # Orderbook less than this depth will be treat as invalid.
+
+			@_should_print_info = Concurrent::Array.new
+			@_should_save_state = Concurrent::Array.new
+			@_helper_thread = Thread.new {
+				loop {
+					save_state_sync() if @_should_save_state.delete_at(0) != nil
+					print_info_sync() if @_should_print_info.delete_at(0) != nil
+					sleep 0.1
+				}
+			}
+			@_helper_thread.priority = -99
 		end
 
 		def _odbk_valid?(odbk)
@@ -109,9 +120,7 @@ module URN
 		end
 
 		def print_info
-			Concurrent::Future.execute(executor: URN::CachedThreadPool) {
-				print_info_sync()
-			}
+			@_should_print_info.push(true)
 		end
 
 		def _stat_inc(key, value=1)
@@ -150,9 +159,7 @@ module URN
 
 		def save_state_async
 			return if @mode == :backtest
-			Concurrent::Future.execute(executor: URN::CachedThreadPool) {
-				save_state_sync()
-			}
+			@_should_save_state.push(true)
 		end
 		def save_state_sync
 			data_dir = './trader_state/'

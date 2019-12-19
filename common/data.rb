@@ -45,8 +45,8 @@ module URN
 
 			@debug = opt[:debug] == true
 			@verbose = opt[:verbose] == true
-			@wait_chars = '\|/-'
-			@wait_ct = 0
+			@spin_chars = '\|/-'
+			@work_ct = 0
 		end
 
 		def drive(algo_class)
@@ -110,13 +110,10 @@ module URN
 			work_thread = Thread.new do
 				begin
 					loop do
-						if @redis_odbk_chg
-							work_cycle()
-							print "\r#{@wait_chars[@wait_ct % @wait_chars.size]}" unless @verbose
-							@wait_ct += 1
-						else
-							sleep()
-						end
+						sleep() unless @redis_odbk_chg
+						work_cycle()
+						print "\r#{@spin_chars[@work_ct % @spin_chars.size]}" unless @verbose
+						@work_ct += 1
 					end
 				rescue => e
 					APD::Logger.error e
@@ -132,7 +129,7 @@ module URN
 			cost_t = (now - start_t)*1000
 			if @market_snapshot.empty?
 				if @verbose
-					@_stat_line += ['func', cost_t.round(3).to_s.ljusy(5)]
+					@_stat_line += ['func', cost_t.round(3).to_s.ljust(5)]
 					puts "#{@_stat_line.join(' ')}    ", nohead:true, inline:true, nofile:true
 				end
 			else
@@ -177,8 +174,6 @@ module URN
 			@market_pairs = market_pairs.clone
 			@pairs = market_pairs.keys
 			@debug = opt[:debug] == true
-			@wait_chars = '\|/-'
-			@wait_ct = 0
 
 			# Data frame: [type, data(contains timestamp)]
 			@current_data_frame = {}

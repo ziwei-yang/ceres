@@ -1098,7 +1098,7 @@ module URN
 			puts "@cancel_jobs[#{mkt}][#{i}] spawning"
 
 			@alive_orders[mkt][i] = trade
-			future = Concurrent::Future.execute(executor: URN::CachedThreadPool) {
+			future = URN.async {
 				# Cancel until finished.
 				canceled_o = market_client(mkt).cancel_order(trade['pair'], trade)
 				on_order_update(canceled_o)
@@ -1266,6 +1266,10 @@ module URN
 				raise "Unknown trade mode #{@trade_mode.inspect}"
 			end
 			@initializing = true
+			@http_lib ||= :restclient
+			@http_proxy_str ||= [nil]
+			@http_proxy_array ||= [nil]
+
 			@sha512_digest = OpenSSL::Digest.new('sha512')
 			@sha384_digest = OpenSSL::Digest.new('sha384')
 			@sha256_digest = OpenSSL::Digest.new('sha256')
@@ -1280,6 +1284,63 @@ module URN
 
 		def redis_db
 			0
+		end
+
+		def mkt_http_req(method, url, opt={})
+			req_t = Time.now
+			header = opt[:header]
+			payload = opt[:payload]
+			timeout = opt[:timeout]
+			display_args = opt[:display_args]
+			silent = opt[:silent] == true
+			if @http_lib == :restclient
+				proxy = @http_proxy_str[0]
+				proxy = @http_proxy_str[rand(@http_proxy_str.size)] if @http_proxy_str.size > 1
+				response = nil
+				pre_t = ((Time.now - req_t)*1000).round(3)
+				puts "--> #{@http_lib} #{method} #{display_args} #{pre_t} ms", level:2 unless silent
+				req_t = Time.now
+				if method == :GET
+					response = RestClient::Request.execute method: :get, url:url, headers:header, payload:payload, proxy:proxy, timeout:timeout
+				elsif method == :POST
+					response = RestClient::Request.execute method: :post, url:url, headers:header, payload:payload, proxy:proxy, timeout:timeout
+				elsif method == :DELETE
+					response = RestClient::Request.execute method: :delete, url:url, headers:header, payload:payload, proxy:proxy, timeout:timeout
+				else
+					raise "Unknown http method: #{method}"
+				end
+				unless silent
+					req_t = ((Time.now - req_t)*1000).round(3)
+					puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms", level:2
+				end
+				return [response, proxy]
+			elsif @http_lib == :http
+				return @http_persistent_pool.with { |conn|
+					http_options = conn.default_options.to_hash
+					proxy = http_options['proxy']
+					conn = conn.timeout(timeout) unless timeout.nil?
+					conn = conn.headers(header) unless header.nil?
+					pre_t = ((Time.now - req_t)*1000).round(3)
+					puts "--> #{@http_lib} #{method} #{display_args} #{pre_t} ms", level:3 unless silent
+					req_t = Time.now
+					if method == :GET
+						response = conn.get url, body:payload
+					elsif method == :POST
+						response = conn.post url, body:payload
+					elsif method == :DELETE
+						response = conn.delete url, body:payload
+					else
+						raise "Unknown http method: #{method}"
+					end
+					unless silent
+						req_t = ((Time.now - req_t)*1000).round(3)
+						puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms", level:3
+					end
+					next [response.to_s, proxy]
+				}
+			else
+				raise "Unknown http lib: #{@http_lib}"
+			end
 		end
 
 		# A name which could be given, default as market_name()
@@ -2163,7 +2224,7 @@ module URN
 			# Make sure to put order under managed before future is created.
 			order_cache[client_oid] = order
 			puts "place_order_async [#{order['market']}] [#{client_oid}] spawning\n#{format_trade(order)}"
-			future = Concurrent::Future.execute(executor: URN::CachedThreadPool) {
+			future = URN.async {
 				begin
 					trade = place_order(order['pair'], order, opt)
 					if trade.nil?
@@ -2461,7 +2522,7 @@ module URN
 				end
 			end
 
-			future = Concurrent::Future.execute(executor: URN::CachedThreadPool, &block)
+			future = URN.async({}, &block)
 			future_e = nil
 			loop_start_t = Time.now.to_f
 			wait_ct = 0
@@ -2840,7 +2901,7 @@ module URN
 				puts order.to_json
 				raise "order must be alive" unless order_alive?(order)
 				raise "order id must be string" unless id.is_a?(String)
-				raise "order status must be new" unless order['status'] == 'new'
+				raise "order status must be new" unless (order['status'] == 'new' || order_pending?(order))
 				raise "order executed must be zero" unless order['executed'] == 0
 				sleep 1
 				order['_data'] ||= {}
@@ -2881,8 +2942,8 @@ module URN
 				puts "data:#{o['_data']}"
 				raise "query_orders must keep _data" if o['_data']['custom'] != data
 			end
-			# ETH alive order should be empty.
-			orders = active_orders(pair, verbose:true)
+			# Alive order with desired price should be empty.
+			orders = active_orders(pair, verbose:true).select { |o| o['p'] == order_args['p'] }
 			raise "Still have alive #{pair} orders left." unless orders.empty?
 			################### TEST C ###################
 			# Place orders then cancel_all_orders(pair), then cancel_all_orders() again
@@ -2981,6 +3042,8 @@ module URN
 			if ARGV.empty?
 				return
 			elsif ARGV[0] == 'wsskey'
+				# Wait until http pool is created.
+				sleep 3 unless @http_persistent_pool.nil?
 				# Generate websocket authentication key.
 				puts "Websocket key:\n#{wss_key()}"
 				return

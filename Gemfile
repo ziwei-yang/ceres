@@ -8,6 +8,7 @@ gem 'parallel'
 gem 'gli'
 gem 'ecdsa'
 gem 'oj' if RUBY_ENGINE == 'ruby'
+gem 'http', '5.0.0.pre'
 
 gem 'sinatra'
 gem 'sinatra-namespace'

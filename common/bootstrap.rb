@@ -12,8 +12,16 @@ require 'http'
 require 'ecdsa'
 require 'oj' if RUBY_ENGINE == 'ruby'
 require 'securerandom'
+require 'http'
 
 module URN
+	# Common functions here
+	def self.async(opt={}, &block)
+		pool = URN::CachedThreadPool
+		puts ["ThreadPool ASYNC q", pool.queue_length, "length", pool.length, "max", pool.largest_length], level:2
+		Concurrent::Future.execute(executor: URN::CachedThreadPool, &block)
+	end
+
 	module Misc
 		USE_OJ = RUBY_ENGINE == 'ruby'
 
@@ -634,6 +642,7 @@ unless defined? URN::BOOTSTRAP_LOAD_STARTED
 		split(',').
 		map { |str| str=='default'?nil:str }
 	# will create as many threads as necessary for work posted to it
-	URN::CachedThreadPool = Concurrent::CachedThreadPool.new
+	# https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/ThreadPoolExecutor.html
+	URN::CachedThreadPool = Concurrent::CachedThreadPool.new(idletime:2147483647)
 	URN::BOOTSTRAP_LOAD = true
 end
