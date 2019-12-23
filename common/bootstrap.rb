@@ -22,6 +22,15 @@ module URN
 		Concurrent::Future.execute(executor: URN::CachedThreadPool, &block)
 	end
 
+	class FutureWatchdog
+		def initialize(thread)
+			@thread = thread || raise("No thread given")
+		end
+		def update(time, value, reason)
+			@thread.wakeup
+		end
+	end
+
 	module Misc
 		USE_OJ = RUBY_ENGINE == 'ruby'
 
@@ -431,10 +440,9 @@ module URN
 
 	# Fetch trader status from redis and conf files.
 	module TraderStatusUtil
-		include APD::CacheUtil
 		include URN::OrderUtil
-		def redis_db
-			0
+		def redis
+			URN::RedisPool
 		end
 
 		def trader_status(pair)
@@ -641,8 +649,13 @@ unless defined? URN::BOOTSTRAP_LOAD_STARTED
 	URN::API_PROXY = (ENV['API_PROXY'] || 'default').
 		split(',').
 		map { |str| str=='default'?nil:str }
+	# Global resources.
 	# will create as many threads as necessary for work posted to it
 	# https://ruby-concurrency.github.io/concurrent-ruby/master/Concurrent/ThreadPoolExecutor.html
 	URN::CachedThreadPool = Concurrent::CachedThreadPool.new(idletime:2147483647)
+	# Set available redis pool num to zero, so it would not always connect even not needed.
+	URN::RedisPool = APD::TransparentGreedyPoolProxy.new(
+		APD::GreedyRedisPool.new(0, redis_db:0, warn_time:0.005)
+	)
 	URN::BOOTSTRAP_LOAD = true
 end

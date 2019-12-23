@@ -34,11 +34,7 @@ export BITSTAMP_API_DOMAIN='https://www.bitstamp.net/api'
 
 export BYBIT_API_DOMAIN='https://api.bybit.com'
 
-export RUBY_VER='2.6'
-# Setup additional JRuby args
-[[ $RUBY_VER == 'jruby' ]] && \
-	export JRUBY_OPTS='-J-Djruby.objectspace.enabled=false -J-Xmx1024m -Xcompile.invokedynamic=true' && \
-	export RUBYOPT=''
+export RUBY_VER='2.6.5'
 # Setup Ruby JIT options from 2.6
 # http://engineering.appfolio.com/appfolio-engineering/2018/4/3/ruby-26-and-ahead-of-time-compilation
 [[ $RUBY_VER == 2.* ]] && \

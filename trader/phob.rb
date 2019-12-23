@@ -60,7 +60,7 @@ module URN
 
 			if process_order_updates()
 				organize_orders()
-				_core_algo(@latest_odbk, repeat:true)
+				_core_algo(@_latest_odbk, repeat:"process_order_updates -> true")
 			end
 		end
 
@@ -68,7 +68,7 @@ module URN
 		# Or in placing order events: on_place_order_done/on_place_order_rejected
 		# Or after order updates: after organize_orders()
 		def _core_algo(latest_odbk, opt={})
-			puts "One more round _core_algo" if opt[:repeat]
+			puts "Repeat _core_algo #{opt[:repeat]}" if opt[:repeat]
 			return if latest_odbk.nil?
 			bids, asks, t, mkt_t = latest_odbk
 			t = mkt_t unless mkt_t.nil?
@@ -102,6 +102,7 @@ module URN
 			place_order('sell', ask_price, @maker_size) if need_place_sell
 
 			@_stat_line = [bid_price, bid_top_p, ask_top_p, ask_price].join(' ')
+			puts "Repeat _core_algo done #{opt[:repeat]}" if opt[:repeat]
 		end
 
 		def on_new_filled_orders(new_filled_orders)

@@ -29,7 +29,7 @@ module URN
 			@market_clients = @market_pairs.to_a.map do |mp|
 				m, p = mp
 				# Listen orderbook only.
-				@redis_sub_channels["URANUS:#{m}:#{p}:orderbook_channel"] = mp
+				@redis_sub_channels["URANUS:#{m}:#{p}:full_odbk_channel"] = mp
 				c = nil
 				if @mode == :dryrun
 					puts "Initializing market #{m} #{p} for asset manager"
@@ -66,24 +66,27 @@ module URN
 			else
 				raise "Unknown argument. #{algo_class}"
 			end
+			# Set aggressive redis pool
+			if redis() == URN::RedisPool
+				redis().pool.keep_avail_size = 5
+			end
 		end
 
 		def _listen_redis(work_thread)
-			redis_new.subscribe(*(@redis_sub_channels.keys)) do |on|
+			Thread.current.priority = 1
+			work_thread.priority = 2
+			redis.subscribe(*(@redis_sub_channels.keys)) do |on|
 				on.subscribe { |chn, num| puts "Subscribed to ##{chn} (#{num} subscriptions)" }
 				on.message do |chn, msg| # TODO check if channle is orderbook or tick.
 					m, p = mp = @redis_sub_channels[chn]
 					start_t = Time.now.to_f
-					# To much time cost here would lead data updates missing # sleep 5
-					# Don't expect this would receive all updates, so just get snapshots.
-					# refresh_orderbooks() costs 0.5~1.0 ms on localhost, 1~2ms in LAN
-					# could be optimized with broadcasting data directly.
-					# Either don't put refresh_orderbooks() into work_cycle(),
-					# algo.on_odbk() might cost too much time that lead update lost.
+					msg = parse_json(msg) # msg should contains all data.
+					# Too much time cost here would lead data updates falling behind
 					data_chg = refresh_orderbooks(
 						[@market_client_map[m]],
 						[p],
 						@market_snapshot,
+						data: [msg],
 						no_real_p:true,
 						cache: @market_status_cache
 					)
@@ -119,7 +122,6 @@ module URN
 					APD::Logger.error e
 				end
 			end
-			work_thread.priority = 99
 			_listen_redis(work_thread)
 		end
 		def work_cycle # call _work_cycle_int() with timing

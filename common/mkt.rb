@@ -548,9 +548,8 @@ module URN
 		include URN::MathUtil
 		include URN::OrderUtil
 		include APD::LockUtil
-		include APD::CacheUtil
-		def redis_db
-			0
+		def redis
+			URN::RedisPool
 		end
 
 		############################# Client GET/SET ##########################
@@ -788,9 +787,9 @@ module URN
 			grouped_orders = {}
 			ungrouped_orders = []
 			orders.each do |o|
+				grouped_orders[o['market']] ||= {}
+				grouped_orders[o['market']][o['pair']] ||= []
 				if order_alive?(o)
-					grouped_orders[o['market']] ||= {}
-					grouped_orders[o['market']][o['pair']] ||= []
 					grouped_orders[o['market']][o['pair']].push o
 				else
 					ungrouped_orders.push o
@@ -809,7 +808,7 @@ module URN
 					else
 						new_orders = market_client(market).
 							send(batch_method, pair, orders, verbose:false, allow_fail:opt[:allow_fail])
-						new_orders.each do |o|
+						(new_orders || orders).each do |o|
 							returned_orders[market][o['i']] = o
 						end
 					end
@@ -1000,18 +999,14 @@ module URN
 
 			@cancel_jobs = Concurrent::Hash.new
 
-			@_oms_broadcast_channels = {}
 			markets.each do |mkt|
 				@alive_orders[mkt] ||= Concurrent::Hash.new
 				@dead_orders[mkt] ||= Concurrent::Hash.new
 				@cancel_jobs[mkt] ||= Concurrent::Hash.new
-				# oms.js : `URANUS:${exchange}:${account}:O_channel`;
-				@_oms_broadcast_channels["URANUS:#{mkt}:-:O_channel"] = mkt
 			end
 
+			URN::OMSLocalCache.monitor(markets, [self])
 			@refresh_thread = Thread.new { refresh_alive_orders() }
-			@redis_listening_thread = Thread.new { _listen_oms_to_refresh() }
-			@redis_listening_thread.priority = -99
 			@maintain_thread = Thread.new { maintain_jobs() }
 
 			puts "#{self.class} init with markets: #{markets}"
@@ -1086,8 +1081,9 @@ module URN
 					puts "@cancel_jobs[#{mkt}][#{i}] is :pending_spawn already"
 					return
 				elsif @cancel_jobs[mkt][i] == :completed
-					puts "@cancel_jobs[#{mkt}][#{i}] is :completed already"
-					return
+					# Completed does not mean canceled
+					# puts "@cancel_jobs[#{mkt}][#{i}] is :completed already"
+					# return
 				end
 			elsif @cancel_jobs[mkt][i] != nil # Must be Future now
 				puts "@cancel_jobs[#{mkt}][#{i}] is running already"
@@ -1095,7 +1091,7 @@ module URN
 			end
 			@cancel_jobs[mkt][i] = :pending_spawn
 
-			puts "@cancel_jobs[#{mkt}][#{i}] spawning"
+			puts "@cancel_jobs[#{mkt}][#{i}] spawning\n".blue + format_trade(trade)
 
 			@alive_orders[mkt][i] = trade
 			future = URN.async {
@@ -1149,25 +1145,15 @@ module URN
 			raise "#{self.class.name()} refresh_alive_orders() quit"
 		end
 
-		def _listen_oms_to_refresh
-			redis_new.subscribe(*(@_oms_broadcast_channels.keys)) do |on|
-				on.subscribe { |chn, num| puts "Subscribed to #{chn} (#{num} subscriptions)" }
-				on.message do |chn, msg|
-					mkt = @_oms_broadcast_channels[chn]
-					# msg is changed order id array, splited by space
-					msg.split(' ').each do |i|
-						o = @alive_orders.dig(mkt, i)
-						next if o.nil?
-						puts "<< OMS/B #{mkt} #{i}"
-						new_o = market_client(mkt).query_order(o['pair'], o, allow_fail:true)
-						next if new_o.nil?
-						# check if status changed?
-						next unless order_changed?(o, new_o)
-						on_order_update(new_o)
-					end
+		def on_oms_broadcast(mkt, i, json_str)
+			URN.async {
+				o = @alive_orders.dig(mkt, i)
+				if o != nil
+					puts "<< OMS/B #{mkt} #{i} #{json_str.size}"
+					new_o = market_client(mkt).query_order(o['pair'], o, oms_json: JSON.parse(json_str))
+					on_order_update(new_o) if new_o != nil && order_changed?(o, new_o)
 				end
-				on.unsubscribe { |chn, num| raise "Unsubscribed to ##{chn} (#{num} subscriptions)" }
-			end
+			}
 		end
 
 		# Should run separately.
@@ -1239,7 +1225,6 @@ module URN
 		include URN::BalanceManager
 		include URN::Misc
 		include APD::LockUtil
-		include APD::CacheUtil
 		include APD::LogicControl
 
 		SATOSHI = 0.00000001
@@ -1282,8 +1267,8 @@ module URN
 			@operation_time = DateTime.now - 60/(24.0*3600)
 		end
 
-		def redis_db
-			0
+		def redis
+			URN::RedisPool
 		end
 
 		def mkt_http_req(method, url, opt={})
@@ -1315,13 +1300,13 @@ module URN
 				end
 				return [response, proxy]
 			elsif @http_lib == :http
+				# http_persistent_pool reuses TCP connections so timeout setting is not supported.
+				# additional per-connection settings are ignored: timeout, headers
 				return @http_persistent_pool.with { |conn|
 					http_options = conn.default_options.to_hash
 					proxy = http_options['proxy']
-					conn = conn.timeout(timeout) unless timeout.nil?
-					conn = conn.headers(header) unless header.nil?
 					pre_t = ((Time.now - req_t)*1000).round(3)
-					puts "--> #{@http_lib} #{method} #{display_args} #{pre_t} ms", level:3 unless silent
+					puts "--> #{@http_lib} #{method} #{display_args} #{pre_t} ms", level:4 unless silent
 					req_t = Time.now
 					if method == :GET
 						response = conn.get url, body:payload
@@ -1334,7 +1319,7 @@ module URN
 					end
 					unless silent
 						req_t = ((Time.now - req_t)*1000).round(3)
-						puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms", level:3
+						puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms", level:4
 					end
 					next [response.to_s, proxy]
 				}
@@ -2212,19 +2197,17 @@ module URN
 			order
 		end
 
-		# This method would return nothing
+		# This method would return new order's client_oid
 		# And keep order under managed in cache.
 		def place_order_async(order, listener, order_cache, opt={})
 			opt = opt.clone
-			if opt[:client_oid].nil?
-				order['client_oid'] = client_oid = generate_clientoid(order['pair'])
-			else
-				order['client_oid'] = client_oid = opt[:client_oid]
-			end
+			order['client_oid'] = client_oid = generate_clientoid(order['pair'])
 			# Make sure to put order under managed before future is created.
 			order_cache[client_oid] = order
-			puts "place_order_async [#{order['market']}] [#{client_oid}] spawning\n#{format_trade(order)}"
+			puts "place_order_async [#{order['market']}] [#{client_oid}] spawning\n".blue + format_trade(order)
 			future = URN.async {
+				old_priority = Thread.current.priority
+				Thread.current.priority = 3
 				begin
 					trade = place_order(order['pair'], order, opt)
 					if trade.nil?
@@ -2234,8 +2217,12 @@ module URN
 					end
 				rescue => e
 					listener.on_place_order_rejected(client_oid, e)
+				ensure
+					puts "place_order_async [#{order['market']}] [#{client_oid}] finished".blue
+					Thread.current.priority = old_priority
 				end
 			}
+			client_oid
 		end
 
 		# For OMS only, might be extended into market clients.
@@ -2257,6 +2244,16 @@ module URN
 			puts ">> OMS/#{pair} #{id_list}" if verbose
 			if id_list.is_a?(String)
 				id = id_list
+				if URN::OMSLocalCache.support_mkt?(market_name())
+					info = URN::OMSLocalCache.oms_info(market_name(), id)
+					if info.nil?
+						puts "<< OMS cache null for #{id}" if verbose
+					else
+						info = JSON.parse(info)
+						puts "<< OMS cache #{info.size}" if verbose
+					end
+					return info
+				end
 				t, info = limit_retry(retry_ct:2) { redis.hmget(hash_name, 't', id) }
 				if info.nil?
 					puts "<< OMS null for #{id_list}" if verbose
@@ -2281,6 +2278,15 @@ module URN
 				puts "<< OMS #{info.size}" if verbose
 				return JSON.parse(info)
 			elsif id_list.is_a?(Array)
+				if URN::OMSLocalCache.support_mkt?(market_name())
+					info_list = id_list.map { |id|
+						info = URN::OMSLocalCache.oms_info(market_name(), id)
+						next nil if info.nil?
+						next JSON.parse(info)
+					}
+					puts "<< OMS cache #{info_list.map { |s| s.nil? ? 'NULL' : s.size }}" if verbose
+					return info_list
+				end
 				args = [hash_name, 't'] + id_list
 				info_list = limit_retry(retry_ct:2) { redis.hmget(*args) }
 				t = info_list[0]
@@ -2523,24 +2529,33 @@ module URN
 			end
 
 			future = URN.async({}, &block)
+			future.add_observer(URN::FutureWatchdog.new(Thread.current))
+			oms_cache_supported = URN::OMSLocalCache.support_mkt?(market_name())
+			if oms_cache_supported
+				URN::OMSLocalCache.add_listener(Thread.current)
+			end
+			puts "oms_cache_supported #{oms_cache_supported}"
 			future_e = nil
 			loop_start_t = Time.now.to_f
 			wait_ct = 0
 			loop do
 				# Check future first after sleep time.
-				if future.fulfilled?
+				future_state = future.state
+				if future_state == :fulfilled
 					json = future.value
 					elapsed_s = Time.now.to_f - loop_start_t
 					puts "Future #{client_oid} fulfilled. #{(1000*elapsed_s).round(1)}ms"
 					break
 				end
-				# Check OMS, cost 1~3ms
+				# Check OMS, cost 1~3ms, extreme mode 3000ms
+				redis_t = Time.now
 				oms_json = oms_order_info(pair, client_oid, verbose:false)
+				redis_t = ((Time.now - redis_t)*1000).round(3)
 				if oms_json != nil # order appearred in OMS. Leave future alone.
 					oms_json['_from_oms'] = true
 					json = oms_json
 					if mode == :new || mode == :query_new
-						puts "Order #{client_oid} found \##{wait_ct}"
+						puts "Order #{client_oid} found \##{wait_ct}\nfuture:#{future_state} -> #{future.state} redis_t:#{redis_t} ms"
 						break
 					elsif mode == :cancel
 						trade = _normalize_trade(pair, json)
@@ -2558,7 +2573,11 @@ module URN
 						elapsed_s = Time.now.to_f - loop_start_t
 						puts "_async #{market_name()} #{pair} #{client_oid} \##{wait_ct} #{(1000*elapsed_s).round(1)}ms"
 					end
-					sleep 0.001
+					if oms_cache_supported
+						sleep() # Future and OMSLocalCache all would wake this up.
+					else
+						sleep 0.001 # Need to check OMS manually.
+					end
 				else # REST API finished.
 					if future.fulfilled?
 						json = future.value
@@ -2601,7 +2620,7 @@ module URN
 
 			balance_cache_update(trade, just_placed:true)
 			write_custom_data(trade)
-			puts "New order #{trade['i']}"
+			puts "#{market_name()} new order #{trade['i']}"
 			print "#{format_trade(trade)}\n"
 			trade
 		end
@@ -4038,10 +4057,9 @@ module URN
 		include URN::MarketPairUtil
 		include URN::Misc
 		include APD::LogicControl
-		include APD::CacheUtil
 
-		def redis_db
-			0
+		def redis
+			URN::RedisPool
 		end
 
 		# Get markets that has valid market data currently.
@@ -4096,6 +4114,10 @@ module URN
 		# Support pair_list as single pair or list.
 		# if opt[:order_pairs] is given as list, use this in order['pair'] and p_real()
 		# if opt[:no_real_p] is true, stop computing real price for better speed.
+		#
+		# Normally used when broadcast with full snapshot:
+		# if opt[:data] is given, data would be used directly but not from latest_orderbook()
+		#
 		# Defensive code is removed because high frequency calling.
 		def refresh_orderbooks(mkt_clients, pair_list, snapshot, opt={})
 			if pair_list.is_a?(String)
@@ -4112,7 +4134,7 @@ module URN
 			@_valid_warning ||= {}
 			data_chg = false
 			now = (Time.now.to_f*1000).to_i
-			odbk_list = latest_orderbook mkt_clients, pair_list, opt
+			odbk_list = opt[:data] || latest_orderbook(mkt_clients, pair_list, opt)
 			mkt_clients.zip(odbk_list, pair_list).each do |client, odbk, pair|
 				next if odbk.nil?
 				snapshot[client.given_name] ||= {}

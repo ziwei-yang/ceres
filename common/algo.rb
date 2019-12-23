@@ -52,12 +52,18 @@ module URN
 			@_should_save_state = Concurrent::Array.new
 			@_helper_thread = Thread.new {
 				loop {
-					save_state_sync() if @_should_save_state.delete_at(0) != nil
-					print_info_sync() if @_should_print_info.delete_at(0) != nil
+					if @_should_save_state.delete_at(0) != nil
+						@_should_save_state.clear
+						save_state_sync()
+					end
+					if @_should_print_info.delete_at(0) != nil
+						@_should_print_info.clear
+						print_info_sync()
+					end
 					sleep 0.1
 				}
 			}
-			@_helper_thread.priority = -99
+			@_helper_thread.priority = -3
 		end
 
 		def _odbk_valid?(odbk)
@@ -221,6 +227,10 @@ module URN
 		# And should return as fast as possible.
 		def on_order_update(trade)
 			@_incoming_updates.push(trade)
+			if process_order_updates()
+				organize_orders()
+				_core_algo(@_latest_odbk, repeat:"on_order_update() #{trade['i']}")
+			end
 		end
 		def process_order_updates() # Just like query_orders() in local cache.
 			return false if @_incoming_updates.empty?
@@ -244,8 +254,8 @@ module URN
 					break
 				end
 				next if found
-				# Some updates belongs to known dead orders.
-				# Most of them are duplicated canceled notifications.
+				# Very few updates belongs to known dead orders.
+				# They are duplicated canceled notifications.
 				(new_o['T'] == 'buy' ? @dead_buy_orders : @dead_sell_orders).each do |o|
 					next unless order_same?(o, new_o)
 					found = true
@@ -266,7 +276,6 @@ module URN
 			return true if @mode == :backtest || updated
 			return updated
 		end
-		thread_safe :on_order_update, :process_order_updates
 
 		# Classify orders by state if process_order_updates() returns true.
 		def organize_orders
@@ -338,7 +347,7 @@ module URN
 			(trade['T'] == 'buy' ? @buy_orders : @sell_orders).push(trade)
 			print_info() if @verbose
 			@mgr.monitor_order(trade)
-			_core_algo(@latest_odbk, repeat:true)
+			_core_algo(@_latest_odbk, repeat:"on_place_order_done #{client_oid}")
 		end
 
 		def on_place_order_rejected(client_oid, e=nil)
@@ -346,7 +355,7 @@ module URN
 			APD::Logger.error e unless e.nil?
 			@pending_orders.delete(client_oid)
 			print_info() if @verbose
-			_core_algo(@latest_odbk, repeat:true)
+			_core_algo(@_latest_odbk, repeat:"on_place_order_rejected #{client_oid}")
 		end
 
 		###############################################
@@ -355,7 +364,7 @@ module URN
 		# Callback: on_place_order_done/on_place_order_rejected
 		def place_order_async(order, opt)
 			opt[:allow_fail] = true # Force allowing fail.
-			@mgr.place_order_async(order, self, @pending_orders, opt)
+			client_oid = @mgr.place_order_async(order, self, @pending_orders, opt)
 		end
 		# Callback: on_order_update()
 		def cancel_order_async(orders)

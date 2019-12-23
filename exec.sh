@@ -8,6 +8,7 @@ file=$1
 source $DIR/conf/env.sh
 rvm use $RUBY_VER # Setup Ruby env.
 basename=$( basename $file )
+echo $basename
 if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'print_xfr.rb' ] || \
 	[ $basename == 'trader_report.rb' ] || \
@@ -36,8 +37,12 @@ then
 		source $DIR/conf/dummy_env.sh
 		source $DIR/conf/env.sh
 	fi
+	# echo "For HFT algos, enable jruby"
+	# source $DIR/conf/env_jruby.sh
+	# rvm use $RUBY_VER # Setup Ruby env.
 else
 	source $DIR/conf/env.sh KEY
 fi
 shift
+rm $DIR/Gemfile.lock
 ruby $file $@
