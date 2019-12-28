@@ -17,17 +17,42 @@ require 'http'
 module URN
 	# Common functions here
 	def self.async(opt={}, &block)
-		pool = URN::CachedThreadPool
-		puts ["ThreadPool ASYNC q", pool.queue_length, "length", pool.length, "max", pool.largest_length], level:2
-		Concurrent::Future.execute(executor: URN::CachedThreadPool, &block)
+		name = opt[:name] || 'unamed'
+		puts "async #{name} invoked, thread prio #{Thread.current.priority}", level:2
+		Concurrent::Future.execute(executor: URN::CachedThreadPool) {
+			Thread.current.abort_on_exception = true
+			Thread.current[:name] = "_async " + name
+			puts ["async #{name} running", URN::CachedThreadPool.largest_length], level:3
+			ret = block.call()
+			puts ["async #{name} finished", URN::CachedThreadPool.largest_length], level:3
+			ret
+		}
+	end
+
+	def self.async_warmup(num)
+		puts "Warming up for async threadpool #{num}"
+		future_list = num.times.map { |i|
+			URN.async(name: "warm up #{i}") {
+				10000.times { JSON.parse(JSON.pretty_generate({1=>2})) }
+			}
+		}
+		future_list.each_with_index { |f, i|
+			loop {
+				break if f.complete?
+				sleep 0.1
+			}
+		}
+		puts "Warming up for async threadpool #{num} finished", level:2
 	end
 
 	class FutureWatchdog
-		def initialize(thread)
-			@thread = thread || raise("No thread given")
+		def initialize(arg=nil, &block)
+			@thread = arg if arg.is_a?(Thread)
+			@block = block if block_given?
 		end
 		def update(time, value, reason)
-			@thread.wakeup
+			@thread.wakeup if @thread != nil
+			@block.call(time, value, reason) if @block != nil
 		end
 	end
 
@@ -248,6 +273,12 @@ module URN
 			# We could identify them only by price-size-timestamp
 			if o1['i'].to_s > '0' && o2['i'].to_s > '0'
 				return o1['i'] == o2['i']
+			elsif o1['client_oid'] != nil && o2['client_oid'] != nil
+				if o1['s'] != nil && o2['s'] != nil
+					return o1['s'] == o2['s'] && o1['p'] == o2['p']
+				elsif o1['v'] != nil && o2['v'] != nil
+					return o1['v'] == o2['v'] && o1['p'] == o2['p']
+				end
 			end
 			o1['s'] == o2['s'] && o1['p'] == o2['p'] && o1['t'] == o2['t']
 		end
@@ -524,7 +555,6 @@ module URN
 		include APD::SpiderUtil
 		def coinmarket_stat_top99(opt={})
 			return @coin_stat if opt[:cache] != false && @coin_stat != nil
-			puts "Scanning all equities from coinmarketcap.com"
 			url = 'https://api.coinmarketcap.com/v1/ticker/?limit=0'
 			response = nil
 			endless_retry(sleep:5) { response = RestClient.get(url, accpet: :json) }
@@ -579,7 +609,6 @@ module URN
 		def _coinmarket_parse_list(url, coin_list, opt={})
 			type = opt[:type]
 			raise "Unknown opt[:type] #{type}" if ['token', 'coin'].include?(type) == false
-			puts "Parsing coinmarketcap list #{url}"
 			html = endless_retry(sleep:5) { parse_web(url) }
 			html.clone.xpath("//table/tbody/tr").each do |line|
 				cols = line.children.select { |c| c.name == 'td' }.

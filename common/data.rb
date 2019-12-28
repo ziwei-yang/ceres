@@ -1,10 +1,10 @@
 require_relative '../common/bootstrap' unless defined? URN::BOOTSTRAP_LOAD
 
 module URN
-	# Market data subscriber that could also drive algos or just print data.
+	# Market data subscriber that could also drive algo or just print data.
 	class MktDataSource
 		include URN::MarketData
-		attr_reader :algos, :asset_mgr
+		attr_reader :algo, :asset_mgr
 		def initialize(market_pairs, opt={}) # Redis data keys.
 			@market_pairs = market_pairs.clone
 			@markets = @market_pairs.keys
@@ -17,8 +17,6 @@ module URN
 
 			# Listen from redis
 			@redis_sub_channels = {}
-			@redis_odbk_buffer = {}
-			@redis_odbk_chg = false
 			@redis_tick_buffer = {}
 			@redis_tick_chg = false
 
@@ -49,38 +47,38 @@ module URN
 			@work_ct = 0
 		end
 
+		# Only support one algo now.
+		# Use algo work-thread wakeup() to notify.
+		# Very rare senario to run multi algos in one data source thread.
 		def drive(algo_class)
-			raise "@algos has been set" unless @algos.nil?
-			if algo_class.is_a?(Array)
-				@algos = algo_class
-				@algos.each { |alg| alg.mgr = @mgr }
-				puts "Will drive #{@algos.size} algos"
-			elsif algo_class.is_a?(URN::MarketAlgo)
-				@algos = [algo_class]
-				@algos.each { |alg| alg.mgr = @mgr }
+			raise "@algo has been set" unless @algo.nil?
+			if algo_class.is_a?(URN::MarketAlgo)
+				@algo = algo_class
 				puts "Will drive algo #{algo_class.class.name}"
 			elsif algo_class.is_a?(Class)
-				@algos = [algo_class.new(@market_pairs)]
-				@algos[0].mgr = @mgr
+				@algo = algo_class.new(@market_pairs)
 				puts "Will drive #{algo_class.name} market_pairs:#{@market_pairs}"
 			else
 				raise "Unknown argument. #{algo_class}"
 			end
-			# Set aggressive redis pool
-			if redis() == URN::RedisPool
-				redis().pool.keep_avail_size = 5
-			end
+			# Set aggressive redis pool strategy
+			redis.pool.keep_avail_size = 5 if redis() == URN::RedisPool
+			@algo.mgr = @mgr
+			@algo.start()
 		end
 
-		def _listen_redis(work_thread)
+		def _listen_redis()
 			Thread.current.priority = 1
-			work_thread.priority = 2
+			Thread.current[:name] = "DataSource #{@market_pairs} redis"
+			puts "Subscribing #{@redis_sub_channels.keys}"
 			redis.subscribe(*(@redis_sub_channels.keys)) do |on|
 				on.subscribe { |chn, num| puts "Subscribed to ##{chn} (#{num} subscriptions)" }
 				on.message do |chn, msg| # TODO check if channle is orderbook or tick.
 					m, p = mp = @redis_sub_channels[chn]
+
+					# Parse data, msg should contains all data.
 					start_t = Time.now.to_f
-					msg = parse_json(msg) # msg should contains all data.
+					msg = parse_json(msg)
 					# Too much time cost here would lead data updates falling behind
 					data_chg = refresh_orderbooks(
 						[@market_client_map[m]],
@@ -90,73 +88,38 @@ module URN
 						no_real_p:true,
 						cache: @market_status_cache
 					)
-					cost_t = (Time.now.to_f - start_t)*1000
-					@_stat_line = [ 'read', cost_t.round(3).to_s.ljust(6) ]
+					cost_t = ((Time.now.to_f - start_t)*1000).round(3)
 					next unless data_chg
-					buffer = @redis_odbk_buffer
-					# Stack data to unprocessed history
-					if buffer[mp].nil?
-						buffer[mp] = [@market_snapshot[m][:orderbook]]
-					else
-						buffer[mp].push(@market_snapshot[m][:orderbook])
+					if @verbose
+						now = Time.now.to_f
+						changed_odbk = @market_snapshot[m][:orderbook]
+						bids, asks, t, mkt_t = changed_odbk
+						local_time_diff = (now*1000 - t.to_f).round(3)
+						mkt_time_diff = (now*1000 - mkt_t.to_f).round(3)
+						@_stat_line = [
+							m.ljust(8),
+							'odbk', cost_t.to_s.ljust(6),
+							'lag', local_time_diff.to_s.ljust(6), mkt_time_diff.to_s.ljust(6)
+						]
+						if local_time_diff > 30 || mkt_time_diff > 60
+							puts @_stat_line.join(' ')
+						end
 					end
-					@redis_odbk_chg = true
-					work_thread.wakeup
+
+					# Notify algo.
+					if @algo != nil
+						changed_odbk = @market_snapshot[m][:orderbook]
+						@algo.on_odbk({ mp => changed_odbk}, stat_line:@_stat_line)
+					else
+						puts "#{@_stat_line.join(' ')}    ", nohead:true, inline:true, nofile:true
+					end
 				end
 				on.unsubscribe { |chn, num| raise "Unsubscribed to ##{chn} (#{num} subscriptions)" }
 			end
 		end
 
-		################### Work cycle ####################
 		def start
-			# sleep/wakeup model to check need_update after long time work_cycle
-			work_thread = Thread.new do
-				begin
-					loop do
-						sleep() unless @redis_odbk_chg
-						work_cycle()
-						print "\r#{@spin_chars[@work_ct % @spin_chars.size]}" unless @verbose
-						@work_ct += 1
-					end
-				rescue => e
-					APD::Logger.error e
-				end
-			end
-			_listen_redis(work_thread)
-		end
-		def work_cycle # call _work_cycle_int() with timing
-			start_t = Time.now.to_f
-			_work_cycle_int()
-			now = Time.now.to_f
-			cost_t = (now - start_t)*1000
-			if @market_snapshot.empty?
-				if @verbose
-					@_stat_line += ['func', cost_t.round(3).to_s.ljust(5)]
-					puts "#{@_stat_line.join(' ')}    ", nohead:true, inline:true, nofile:true
-				end
-			else
-				bids, asks, t, mkt_t = @market_snapshot[@markets[0]][:orderbook]
-				local_time_diff = now*1000 - t.to_i
-				mkt_time_diff = now*1000 - mkt_t.to_i
-				if @verbose
-					@_stat_line += [
-						'work', cost_t.round(3).to_s.ljust(5),
-						'latency', local_time_diff.round(3).to_s.ljust(6), mkt_time_diff.round(3).to_s.ljust(6)
-					]
-					@_stat_line += (@algos || []).map { |alg| alg._stat_line }
-					puts "#{@_stat_line.join(' ')}    ", nohead:true, inline:true, nofile:true
-				end
-			end
-		end
-		def _work_cycle_int
-			return if @redis_odbk_chg == false
-			# Data has been changed for 1 or more times.
-			# Reset redis data unprocessed buffer
-			unprocessed_buffer = @redis_odbk_buffer
-			@redis_odbk_buffer = {}
-			@redis_odbk_chg = false
-			return if @algos.nil?
-			@algos.each { |alg| alg.on_odbk(unprocessed_buffer) }
+			_listen_redis()
 		end
 	end
 

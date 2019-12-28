@@ -994,20 +994,25 @@ module URN
 		include APD::LockUtil
 		def initialize(markets, listeners=[])
 			@listeners = listeners
+			@pending_orders = Concurrent::Hash.new
 			@alive_orders = Concurrent::Hash.new
 			@dead_orders = Concurrent::Hash.new
 
 			@cancel_jobs = Concurrent::Hash.new
 
 			markets.each do |mkt|
+				@pending_orders[mkt] ||= Concurrent::Hash.new
 				@alive_orders[mkt] ||= Concurrent::Hash.new
 				@dead_orders[mkt] ||= Concurrent::Hash.new
 				@cancel_jobs[mkt] ||= Concurrent::Hash.new
 			end
 
 			URN::OMSLocalCache.monitor(markets, [self])
-			@refresh_thread = Thread.new { refresh_alive_orders() }
-			@maintain_thread = Thread.new { maintain_jobs() }
+			@refresh_thread = Thread.new(abort_on_exception:true) {
+				Thread.current[:name] = "StandardMarketManager.refresh_thread"
+				refresh_alive_orders()
+			}
+			@refresh_thread.priority = -3
 
 			puts "#{self.class} init with markets: #{markets}"
 		end
@@ -1033,14 +1038,18 @@ module URN
 
 		# Synchronisely place order.
 		def place_order(o, opt={})
+			puts "Deprecated, should call place_order_async()".red
 			trade = market_client(o).place_order(o['pair'], o, opt)
 			return trade if trade.nil?
 			monitor_order(trade)
 			trade
 		end
 
-		def place_order_async(o, listener, order_cache, opt={})
-			market_client(o).place_order_async(o, listener, order_cache, opt)
+		def place_order_async(o, order_cache, opt={})
+			client_oid = market_client(o).place_order_async(o, order_cache, opt)
+			# Add into monitor list.
+			@pending_orders[o['market']][client_oid] = o
+			client_oid
 		end
 
 		# Algo should not be blocked here.
@@ -1062,49 +1071,29 @@ module URN
 			return if order_alive?(trade) == false
 			return if order_canceling?(trade)
 
-			mkt = trade['market']
-			i = trade['i']
-			if @dead_orders[mkt][i] != nil
-				# Order in record is dead already?
-				puts "@cancel_jobs[#{mkt}][#{i}] dismissed, order is dead already."
-				return
-			end
-
-			trade = trade.clone # Clone this to avoid data overwritten in thread.
-
-			# Stop to cancel order twice.
-			# When jobs is a future, stop doing.
-			# When jobs is :pending_spawn, stop doing.
-			# When jobs is :completed or :rejected, could cancel it again
-			if @cancel_jobs[mkt][i].is_a?(Symbol)
-				if @cancel_jobs[mkt][i] == :pending_spawn
-					puts "@cancel_jobs[#{mkt}][#{i}] is :pending_spawn already"
-					return
-				elsif @cancel_jobs[mkt][i] == :completed
-					# Completed does not mean canceled
-					# puts "@cancel_jobs[#{mkt}][#{i}] is :completed already"
-					# return
-				end
-			elsif @cancel_jobs[mkt][i] != nil # Must be Future now
-				puts "@cancel_jobs[#{mkt}][#{i}] is running already"
-				return
-			end
-			@cancel_jobs[mkt][i] = :pending_spawn
-
-			puts "@cancel_jobs[#{mkt}][#{i}] spawning\n".blue + format_trade(trade)
-
-			@alive_orders[mkt][i] = trade
-			future = URN.async {
-				# Cancel until finished.
-				canceled_o = market_client(mkt).cancel_order(trade['pair'], trade)
-				on_order_update(canceled_o)
-			}
-			@cancel_jobs[mkt][i] = future
+			market_client(trade).cancel_order_async(trade, opt)
 		end
 
 		def on_order_update(new_o)
 			new_o = new_o.clone
 			mkt, i = new_o['market'], new_o['i']
+
+			# Search o in pending_orders
+			o = @pending_orders.dig(mkt, new_o['client_oid'])
+			if o != nil
+				client_oid = new_o['client_oid']
+				puts "mgr.pending_orders get updates #{client_oid}"
+				@pending_orders[mkt].delete(client_oid)
+				if order_alive?(new_o)
+					@alive_orders[mkt][i] = new_o
+				else
+					@dead_orders[mkt][i] = new_o
+				end
+				# Notify
+				@listeners.each { |l| l.on_place_order_done(client_oid, new_o) }
+				return
+			end
+
 			# Get order form snapshot
 			o = @alive_orders.dig(mkt, i) ||
 				@dead_orders.dig(mkt, i) ||
@@ -1123,7 +1112,6 @@ module URN
 			# Notify
 			@listeners.each { |l| l.on_order_update(new_o) }
 		end
-		thread_safe :on_order_update
 
 		def refresh_alive_orders
 			loop do # Avoid iteration in thread
@@ -1145,37 +1133,13 @@ module URN
 			raise "#{self.class.name()} refresh_alive_orders() quit"
 		end
 
+		# ID could be id and client_oid.
 		def on_oms_broadcast(mkt, i, json_str)
-			URN.async {
-				o = @alive_orders.dig(mkt, i)
-				if o != nil
-					puts "<< OMS/B #{mkt} #{i} #{json_str.size}"
-					new_o = market_client(mkt).query_order(o['pair'], o, oms_json: JSON.parse(json_str))
-					on_order_update(new_o) if new_o != nil && order_changed?(o, new_o)
-				end
-			}
-		end
-
-		# Should run separately.
-		def maintain_jobs
-			loop do # Avoid iteration in thread.
-				@cancel_jobs.keys.each do |mkt|
-					@cancel_jobs[mkt].keys.each do |i|
-						future = @cancel_jobs.dig(mkt, i)
-						next if future.is_a?(Symbol) # pending_spawn rejected completed
-						if future.rejected? # Log reason.
-							@cancel_jobs[mkt][i] = :rejected
-							puts "@cancel_jobs[#{mkt}][#{i}] failed"
-							APD::Logger.error future.reason
-						else
-							@cancel_jobs[mkt][i] = :completed
-							puts "@cancel_jobs[#{mkt}][#{i}] finished"
-						end
-					end
-				end
-				sleep 1
-			end
-			raise "#{self.class.name()} maintain_jobs() quit"
+			o = @alive_orders.dig(mkt, i) || @pending_orders.dig(mkt, i)
+			return if o.nil?
+			puts "<< OMS/B #{mkt} #{i} #{json_str.size}"
+			new_o = market_client(mkt).query_order(o['pair'], o, oms_json: JSON.parse(json_str))
+			on_order_update(new_o)
 		end
 	end
 
@@ -1265,6 +1229,10 @@ module URN
 			puts "Initializing #{market_name} - finished" if @verbose
 			# Record last operation time. For discarding old market data snapshot.
 			@operation_time = DateTime.now - 60/(24.0*3600)
+
+			# Async jobs
+			@cancel_jobs = Concurrent::Hash.new
+			@cancel_cmd_t = Concurrent::Hash.new
 		end
 
 		def redis
@@ -1484,7 +1452,7 @@ module URN
 			begin
 				raise "stack probe"
 			rescue => e
-				APD::Logger.error e
+				APD::Logger.log e
 			end
 			sleep wait_time
 		end
@@ -1504,7 +1472,8 @@ module URN
 			n, timespan = limit # N reqs in T seconds for each proxy.
 			return nil if n.nil? || n <= 0
 			return nil if timespan.nil? || timespan <= 0
-			lock_mgr = redis_lock_manager()
+			@@redis_lock_manager ||= Redlock::Client.new([redis()])
+			lock_mgr = @@redis_lock_manager
 			t = (timespan*1000).ceil
 			# Shuffle target (A,P) pair locks.
 			valid_lock, valid_proxy = nil, nil
@@ -1927,7 +1896,7 @@ module URN
 					order['v'] = v
 				end
 			else
-				abort "Unknown quantity_in_orderbook() in #{market_name()}"
+				raise "Unknown quantity_in_orderbook() in #{market_name()}"
 			end
 		end
 
@@ -2047,13 +2016,15 @@ module URN
 
 		def normal_api_error?(e)
 			return false if e.nil?
+			return true if e.is_a?(HTTP::ConnectionError)
+			return true if e.is_a?(HTTP::TimeoutError)
+
 			err_msg, err_res = '', ''
 			if e.is_a?(RestClient::Exception)
 				err_msg, err_res = e.message.to_s, e.response.to_s
 			else
 				err_msg = e.message.to_s
 			end
-			return true if e.is_a?(HTTP::TimeoutError)
 			return true if err_res.include?('Try again')
 			return true if err_msg.include?('Timed out')
 			return true if err_msg.include?('Timeout')
@@ -2199,30 +2170,109 @@ module URN
 
 		# This method would return new order's client_oid
 		# And keep order under managed in cache.
-		def place_order_async(order, listener, order_cache, opt={})
+		def place_order_async(order, order_cache, opt={})
 			opt = opt.clone
 			order['client_oid'] = client_oid = generate_clientoid(order['pair'])
 			# Make sure to put order under managed before future is created.
 			order_cache[client_oid] = order
+			
+			if URN::MarketAgent.support?(order['market'])
+				puts "place_order_async [#{order['market']}] [#{client_oid}] -> remote\n".blue + format_trade(order)
+				cmd = {
+					'method' => 'create',
+					'order'  => order,
+					'opt'    => opt
+				}.to_json
+				URN::MarketAgent.send(redis, order['market'], cmd)
+				return client_oid
+			end
+
 			puts "place_order_async [#{order['market']}] [#{client_oid}] spawning\n".blue + format_trade(order)
-			future = URN.async {
+			future = URN.async(name: "place_order_async #{client_oid}") {
 				old_priority = Thread.current.priority
 				Thread.current.priority = 3
 				begin
 					trade = place_order(order['pair'], order, opt)
-					if trade.nil?
-						listener.on_place_order_rejected(client_oid)
-					else
-						listener.on_place_order_done(client_oid, trade)
-					end
-				rescue => e
-					listener.on_place_order_rejected(client_oid, e)
 				ensure
 					puts "place_order_async [#{order['market']}] [#{client_oid}] finished".blue
 					Thread.current.priority = old_priority
 				end
 			}
 			client_oid
+		end
+
+		MIN_CANCEL_INVERVAL_MS = 2000
+		def cancel_order_async(order, opt={})
+			return if order_alive?(order) == false
+			return if order_canceling?(order)
+			
+			i = order['i']
+			if URN::MarketAgent.support?(order['market'])
+				now = Time.now.to_f # Frequency control 1req/100ms
+				if @cancel_cmd_t[i] != nil
+					passed_ms = ((now - @cancel_cmd_t[i])*1000).round(3)
+					if passed_ms <= MIN_CANCEL_INVERVAL_MS
+						# puts "cancel_order_async #{i} freq control, passed_t: #{passed_ms}ms"
+						return
+					end
+					puts "cancel_order_async #{i} again, passed_t: #{passed_ms}ms"
+				end
+				@cancel_cmd_t[i] = now
+				puts "cancel_order_async [#{order['market']}] [#{i}] -> remote\n".blue + format_trade(order)
+				cmd = {
+					'method' => 'cancel',
+					'order'  => order,
+					'opt'    => opt
+				}.to_json
+				# TODO send() might cost 100ms or more
+				URN::MarketAgent.send(redis, order['market'], cmd)
+				return
+			end
+
+			# Stop to cancel order twice.
+			# When jobs is a future, stop doing.
+			# When jobs is :pending_spawn, stop doing.
+			# When jobs is :completed or :rejected, could cancel it again
+			if @cancel_jobs[i].is_a?(Symbol)
+				if @cancel_jobs[i] == :pending_spawn
+					puts "@cancel_jobs[#{i}] is :pending_spawn already"
+					return
+				elsif @cancel_jobs[i] == :completed
+					# Completed does not mean canceled
+					# puts "@cancel_jobs[#{mkt}][#{i}] is :completed already"
+					# return
+				end
+			elsif @cancel_jobs[mkt][i] != nil # Must be Future now
+				puts "@cancel_jobs[#{mkt}][#{i}] is running already"
+				return
+			end
+			@cancel_jobs[mkt][i] = :pending_spawn
+			puts "cancel_order_async [#{order['market']}] [#{client_oid}] spawning\n".blue + format_trade(order)
+
+			future = URN.async(name: "cancel_order_async #{i}") {
+				old_priority = Thread.current.priority
+				Thread.current.priority = 3
+				begin
+					# Cancel until finished.
+					canceled_o = market_client(mkt).cancel_order(order['pair'], order)
+				ensure
+					puts "cancel_order_async [#{order['market']}] [#{i}] finished".blue
+					Thread.current.priority = old_priority
+				end
+				canceled_o
+			}
+
+			@cancel_jobs[mkt][i] = future
+			@cancel_jobs[mkt][i].add_observer(URN::FutureWatchdog.new() { |time, value, reason|
+				if reason.nil? # Log reason.
+					@cancel_jobs[mkt][i] = :completed
+					puts "@cancel_jobs[#{mkt}][#{i}] finished"
+				else
+					@cancel_jobs[mkt][i] = :rejected
+					puts "@cancel_jobs[#{mkt}][#{i}] failed, #{reason}"
+				end
+			})
+			future
 		end
 
 		# For OMS only, might be extended into market clients.
@@ -2528,7 +2578,7 @@ module URN
 				end
 			end
 
-			future = URN.async({}, &block)
+			future = URN.async({:name => "_async_operate_order #{client_oid} #{mode}"}, &block)
 			future.add_observer(URN::FutureWatchdog.new(Thread.current))
 			oms_cache_supported = URN::OMSLocalCache.support_mkt?(market_name())
 			if oms_cache_supported
@@ -2670,7 +2720,7 @@ module URN
 			# Custom data complement if order is older than 20190407 162800 +0800
 			write_custom_data(new_o) if (new_o['t']||0) < 1554625102130+600_000
 
-			abort "different order:\n#{old_o}\n#{new_o}" unless order_same?(old_o, new_o)
+			raise "different order:\n#{old_o}\n#{new_o}" unless order_same?(old_o, new_o)
 			if old_o == new_o
 				print "#{format_trade(new_o)}\n" if verbose
 				return new_o
@@ -2688,19 +2738,16 @@ module URN
 				new_o['remained'] = new_o['s'] - new_o['executed']
 			end
 			# Step 2: Defensive checking.
+			# Most of them has been checked in order_same?() before
 			order, trade = old_o, new_o
-			if order['i'] != trade['i'] ||
-				(order['s'] || trade['s']) != trade['s'] ||
-				(order['executed'] || trade['executed']) > trade['executed'] ||
+			if (order['executed'] || trade['executed']) > trade['executed'] ||
 				(order['p'] || trade['p']) != trade['p'] ||
 				(order['T'] || trade['T']) != trade['T']
-				puts (order['i'] != trade['i'])
-				puts ((order['s'] || trade['s']) != trade['s'])
-				puts ((order['executed'] || trade['executed']) > trade['executed'])
-				puts ((order['p'] || trade['p']) != trade['p'])
-				puts ((order['T'] || trade['T']) != trade['T'])
-				puts order.to_json
-				puts trade.to_json
+					puts ((order['executed'] || trade['executed']) > trade['executed'])
+					puts ((order['p'] || trade['p']) != trade['p'])
+					puts ((order['T'] || trade['T']) != trade['T'])
+					puts order.to_json
+					puts trade.to_json
 				raise "Unconsistent order:\n#{format_trade(order)}\n#{format_trade(trade)}"
 			end
 			# Step 3: Keep max maker_size
@@ -3284,7 +3331,10 @@ module URN
 						next false unless order_alive?(t)
 						# skip small orders.
 						if market_type == :spot
-							next false if t['p']*t['remained'] < min_vol(pair)
+							if t['p']*t['remained'] < min_vol(pair)
+								puts "skip tiny spot order #{t['i']}:\n#{format_trade(t)}"
+								next false
+							end
 						end
 						if ARGV[3].nil?
 							next true
@@ -3966,7 +4016,7 @@ module URN
 				when :asset
 					orders_in_asset.push oc
 				else
-					abort "Unknown quantity_in_orderbook() #{oc[1].market_name()}"
+					raise "Unknown quantity_in_orderbook() #{oc[1].market_name()}"
 				end
 			end
 			# orders in volume always come with bigger lot. Shrink vol until not changed.

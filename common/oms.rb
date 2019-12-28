@@ -30,14 +30,15 @@ module URN
 			end
 			
 			if started_markets.size > 0
-				t = Thread.new {
+				t = Thread.new(abort_on_exception:true) {
+					Thread.current[:name] = "OMSLocalCache.listen #{started_markets}"
 					begin
 						_listen_oms(channels)
 					rescue => e
 						APD::Logger.error e
 					end
 				}
-				t.priority = 2
+				t.priority = 3
 				puts "OMS cache started for #{started_markets}"
 			end
 		end
