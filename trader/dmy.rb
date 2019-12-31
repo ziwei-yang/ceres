@@ -62,12 +62,12 @@ class DummyAlgo < URN::MarketAlgo
 		bid_top_p, ask_top_p = bids[0]['p'], asks[0]['p']
 		@stat[:mkt_price] = bid_top_p
 
-		# Buy under 6700, sell above 7000
+		# Buy under 7000, sell above 7200
 		new_order_client_oid = nil
-		if ask_top_p < 6700 && @position < @max_position
+		if ask_top_p < 7000 && @position < @max_position
 			new_order_client_oid = place_order('buy', ask_top_p, [(@max_position-@position), @maker_size].min)
 			cancel_all_async('sell')
-		elsif bid_top_p > 7000 && @position > -@max_position
+		elsif bid_top_p > 7200 && @position > -@max_position
 			new_order_client_oid = place_order('sell', bid_top_p, [(@position+@max_position), @maker_size].min)
 			cancel_all_async('buy')
 		else
@@ -132,7 +132,5 @@ mds.drive(algo)
 mds.start()
 
 puts "#{algo.name} finished"
-if opt[:mode] == :backtest
-	stat_list = ret
-	puts JSON.pretty_generate(stat_list[0])
-end
+stat_list = ret
+puts JSON.pretty_generate(stat_list[0])
