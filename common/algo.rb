@@ -107,7 +107,7 @@ module URN
 			@_prepared = true
 			# Force redirect all log in live mode.
 			# Logger would only allow one algo running to direct logs.
-			if @mode == :live
+			if @mode != :backtest
 				APD::Logger.global_output_file = "#{URN::ROOT}/logs/#{@name}.#{@mode}.log"
 			end
 
@@ -256,7 +256,14 @@ module URN
 		def _process_order(new_o)
 			# Clear canceling order record
 			if order_alive?(new_o) == false
-				@canceling_orders[new_o['market']].delete(new_o['i'])
+				canceled_o = @canceling_orders[new_o['market']].delete(new_o['i'])
+				if canceled_o != nil
+					if canceled_o[@exec_k] > 0 # Is this filled ?
+						_stat_inc(:cancel_failed)
+					else
+						_stat_inc(:cancel_success)
+					end
+				end
 			end
 
 			_update_stoploss_order(new_o)
@@ -478,7 +485,7 @@ module URN
 			end
 
 			on_new_filled_orders(new_filled_orders)
-			compute_pnl()
+			compute_pnl() if @mode != :backtest # compute_pnl mannully in backtesting
 			print_info_async() if @verbose
 		end
 
@@ -486,7 +493,6 @@ module URN
 		def on_new_filled_orders(new_filled_orders)
 		end
 
-		# TODO
 		# Calculate realized PnL
 		# leave last orders for current position as unrealized PnL
 		def compute_pnl
@@ -600,6 +606,14 @@ module URN
 			@stat[:taker_ct] = taker_ct
 			@stat[:pnl] = pnl.round(12)
 			@stat[:pos] = @position
+			@stat[:pending_orders] = @pending_orders.size
+			@stat[:canceling_orders] = @canceling_orders.values.map { |a| a.size }.reduce(:+)
+			@stat[:buy_orders] = @buy_orders.size
+			@stat[:sell_orders] = @sell_orders.size
+			@stat[:dead_buy_orders] = @dead_buy_orders.size
+			@stat[:dead_sell_orders] = @dead_sell_orders.size
+			@stat[:archived_buy_orders] = @archived_buy_orders.size
+			@stat[:archived_sell_orders] = @archived_sell_orders.size
 			print_info_async() if @mode == :live
 		end
 
@@ -626,6 +640,7 @@ module URN
 			old_priority = Thread.current.priority
 			Thread.current.priority = 3
 			opt[:allow_fail] = true # Force allowing fail.
+			puts "Placing order\n#{format_trade(order)}".blue if @verbose
 			client_oid = @mgr.place_order_async(order, @pending_orders, opt)
 			Thread.current.priority = old_priority
 			# Pending orders should contains client_oid now
@@ -684,7 +699,7 @@ module URN
 				end
 			end
 			return nil if dup == true
-			puts "Placing stoploss order\n#{format_trade(order)}".on_light_yellow
+			puts "Placing stoploss order\n#{format_trade(order)}".on_light_yellow if @verbose
 			client_oid = place_order_async(order, opt)
 			return nil if client_oid.nil?
 			order = @pending_orders[client_oid]
@@ -709,7 +724,7 @@ module URN
 		# Background tasks - info printing, state saving
 		################################################
 		def print_info_async
-			if @debug
+			if @debug || @mode == :backtest
 				print_info_sync() # Right now!
 			else
 				@_should_print_info.push(true)

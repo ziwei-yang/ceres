@@ -257,23 +257,28 @@ module URN
 							"#{speed_l}K/s"
 						].join(', ')
 					else
+						@algo.compute_pnl()
 						stat = @algo.stat
 						name = @algo.name
 						filled_o = (stat[:filled_buy]||0) + (stat[:filled_sell]||0)
 						total_o = (stat[:dead_buy]||0) + (stat[:dead_sell]||0)
+						cancel_success_o = (stat[:cancel_success] || 0)
+						cancel_total_o = cancel_success_o + (stat[:cancel_failed] || 0)
 						print [
 							"#{(end_t-start_t).round}s",
 						 	"#{history_span_hr.round}hrs",
 							"#{speed_h}/s",
 							"#{speed_l}K/s",
 							name,
-							"pnl:#{stat[:pnl]}",
+							"PnL:#{(stat[:pnl] || 0).round(5)}",
 							"SL:#{stat[:stoploss_ct]}",
-							"fil:#{filled_o}/#{total_o}",
+							"F:#{filled_o}/#{total_o}",
+							"C:#{cancel_success_o}/#{cancel_total_o}",
 							"tk:#{stat[:taker_ct]}",
 							"#{stat[:mkt_price]}",
 							"\n"
 						].join(' ')
+						puts stat if @verbose
 					end
 					seg_t = Time.now.to_f
 				end

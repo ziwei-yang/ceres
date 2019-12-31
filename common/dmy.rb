@@ -92,7 +92,7 @@ module URN
 			# Only mark trade as canceling.
 			trade['_cancel_init_t'] = @last_operation_time = @market_t
 			trade['status'] = 'canceling'
- 			puts "-- Order Cancele request:\n#{format_trade(trade)}" if @verbose
+ 			puts "-- Order Cancel request:\n#{format_trade(trade)}" if @verbose
 			trade
 		end
 
@@ -137,7 +137,9 @@ module URN
 				# Process pending orders.
 				alive_ms = now_ms - o['t']
 				next if alive_ms <= @latency_ms
-				o['status'] = 'new'
+
+				# Don't mark canceling orders to new
+				o['status'] = 'new' if o['status'] == 'pending'
 
 				filled = false
 				if o['T'] == 'buy'

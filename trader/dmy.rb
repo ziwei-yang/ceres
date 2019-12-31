@@ -129,7 +129,7 @@ mds = URN::HistoryMktDataSource.new(
 )
 
 mds.drive(algo)
-mds.start()
+ret = mds.start()
 
 puts "#{algo.name} finished"
 stat_list = ret
