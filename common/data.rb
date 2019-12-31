@@ -271,7 +271,7 @@ module URN
 							"SL:#{stat[:stoploss_ct]}",
 							"fil:#{filled_o}/#{total_o}",
 							"tk:#{stat[:taker_ct]}",
-							"p:#{stat[:mkt_price]}",
+							"#{stat[:mkt_price]}"
 							"\n"
 						].join(' ')
 					end

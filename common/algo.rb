@@ -508,8 +508,9 @@ module URN
 						next
 					else # Order contains part of last pos.
 						size = s - last_pos
-						unrealized_cost += (@vol_based ? (last_pos/p.to_f) : (last_pos*p.to_f))
-						cost -= unrealized_cost
+						part_unrealized_cost = (@vol_based ? (last_pos/p.to_f) : (last_pos*p.to_f))
+						unrealized_cost += part_unrealized_cost
+						cost -= part_unrealized_cost
 						last_pos = 0
 					end
 				else # No unrealized position left, all as realized position
@@ -543,9 +544,10 @@ module URN
 						unrealized_cost += cost
 						next
 					else # Order contains part of last pos.
-						size = last_pos+s
-						unrealized_cost += (@vol_based ? (last_pos.abs/p.to_f) : (last_pos.abs*p.to_f))
-						cost -= unrealized_cost
+						size = s + last_pos
+						part_unrealized_cost = (@vol_based ? (last_pos.abs/p.to_f) : (last_pos.abs*p.to_f))
+						unrealized_cost += part_unrealized_cost
+						cost -= part_unrealized_cost
 						last_pos = 0
 					end
 				else # No unrealized position left, all as realized position
@@ -597,6 +599,7 @@ module URN
 			@stat[:fee] = fee
 			@stat[:taker_ct] = taker_ct
 			@stat[:pnl] = pnl.round(12)
+			@stat[:pos] = @position
 			print_info_async() if @mode == :live
 		end
 
