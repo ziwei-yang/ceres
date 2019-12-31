@@ -1023,38 +1023,38 @@ module URN
 		end
 
 		def monitor_order(trade)
-			if order_alive?(trade)
+			if trade['i'].nil?  # Pending orders
+				@pending_orders[trade['market']][trade['client_oid']] = trade
+			elsif order_alive?(trade)
 				@alive_orders[trade['market']][trade['i']] = trade.clone
 			else
 				@dead_orders[trade['market']][trade['i']] = trade.clone
 			end
 		end
 
+		def query_order(o)
+			market_client(o).query_order(o['pair'], o)
+		end
 		def query_orders(orders)
 			orders.map do |o|
 				next market_client(o).query_order(o['pair'], o)
 			end
 		end
 
-		# Synchronisely place order.
-		def place_order(o, opt={})
-			puts "Deprecated, should call place_order_async()".red
-			trade = market_client(o).place_order(o['pair'], o, opt)
-			return trade if trade.nil?
-			monitor_order(trade)
-			trade
-		end
-
+		# Send place order request and return client_oid
+		# Make sure order is managed in order_cache before requesting.
 		def place_order_async(o, order_cache, opt={})
-			client_oid = market_client(o).place_order_async(o, order_cache, opt)
-			# Add into monitor list.
-			@pending_orders[o['market']][client_oid] = o
-			client_oid
-		end
+			client = market_client(o)
 
-		# Algo should not be blocked here.
-		def cancel_order(pair, trade)
-			raise "Not implemented, should call cancel_order_async()"
+			# Assign client_oid and add into @pending_orders before sending requests.
+			# Sometimes requests failed too fast before client.place_order_async() returns.
+			o['client_oid'] = client_oid = client.generate_clientoid(o['pair'])
+			@pending_orders[o['market']][client_oid] = o
+			# Make sure to put order under managed before request is created.
+			order_cache[client_oid] = o
+
+			client.place_order_async(o, opt)
+			client_oid
 		end
 
 		# Asynchronisely cancel order.
@@ -1137,6 +1137,11 @@ module URN
 		def on_oms_broadcast(mkt, i, json_str)
 			o = @alive_orders.dig(mkt, i) || @pending_orders.dig(mkt, i)
 			return if o.nil?
+			if json_str == 'FAILED' # Notify failure.
+				puts "<< OMS/B #{mkt} #{i} #{json_str}".red
+				@listeners.each { |l| l.on_place_order_rejected(i) }
+				return
+			end
 			puts "<< OMS/B #{mkt} #{i} #{json_str.size}"
 			new_o = market_client(mkt).query_order(o['pair'], o, oms_json: JSON.parse(json_str))
 			on_order_update(new_o)
@@ -2169,12 +2174,14 @@ module URN
 		end
 
 		# This method would return new order's client_oid
-		# And keep order under managed in cache.
-		def place_order_async(order, order_cache, opt={})
+		def place_order_async(order, opt={})
 			opt = opt.clone
-			order['client_oid'] = client_oid = generate_clientoid(order['pair'])
-			# Make sure to put order under managed before future is created.
-			order_cache[client_oid] = order
+			client_oid = order['client_oid']
+			if client_oid.nil?
+				puts "Suggest to assign an order client_oid before place_order_async()".red
+				puts "Sometimes requests failed too fast before client.place_order_async() returns."
+				order['client_oid'] = client_oid = generate_clientoid(order['pair'])
+			end
 			
 			if URN::MarketAgent.support?(order['market'])
 				puts "place_order_async [#{order['market']}] [#{client_oid}] -> remote\n".blue + format_trade(order)

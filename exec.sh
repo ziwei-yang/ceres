@@ -8,6 +8,7 @@ file=$1
 source $DIR/conf/env.sh
 rvm use $RUBY_VER # Setup Ruby env.
 basename=$( basename $file )
+need_log=0
 echo $basename
 if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'print_xfr.rb' ] || \
@@ -20,29 +21,38 @@ if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'save_mkt.rb' ] || \
 	[ $basename == 'filter.rb' ] || \
 	[ $basename == 'test.rb' ] || \
-	[ $basename == 't.rb' ]
-then
+	[ $basename == 't.rb' ] ; then
 	source $DIR/conf/dummy_env.sh
 	source $DIR/conf/env.sh
 elif [ $basename == 'dmy.rb' ] || \
 	[ $basename == 'data.rb' ] || \
 	[ $basename == 'phob.rb' ] || \
-	[ $basename == 'mars.rb' ]
-then
+	[ $basename == 'mars.rb' ] ; then
 	if [[ $@ == *live* ]]; then
 		source $DIR/conf/env.sh KEY
+		echo "For live HFT algos, enable logs"
+		need_log=1
 	elif [[ $@ == *.gz* ]]; then
 		source $DIR/conf/env.sh KEY
 	else
 		source $DIR/conf/dummy_env.sh
 		source $DIR/conf/env.sh
 	fi
-	# echo "For HFT algos, enable jruby"
-	# source $DIR/conf/env_jruby.sh
-	# rvm use $RUBY_VER # Setup Ruby env.
+elif [ $basename == 'agt.rb' ] ; then
+	source $DIR/conf/env.sh KEY
+	need_log=1
 else
 	source $DIR/conf/env.sh KEY
 fi
 shift
+
 rm $DIR/Gemfile.lock
-ruby $file $@
+if [[ $need_log == 0 ]]; then
+	ruby $file $@
+else
+	datetime=`date +"%Y_%m_%d_%H_%M"`
+	log_file="$DIR/logs/$basename_$datetime.log"
+	log_file="$DIR/logs/$basename.log"
+	echo "unbuffer -p ruby $file $@ 2>&1 | tee $log_file"
+	unbuffer -p ruby $file $@ 2>&1 | tee $log_file
+fi

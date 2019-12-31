@@ -97,7 +97,7 @@ module URN
 							next
 						end
 						msg = JSON.parse(msg)
-						puts "<< OMS cache #{mkt} #{msg.keys}"
+						# puts "<< OMS cache #{mkt} #{msg.keys}"
 						@@oms_local_cache[mkt].merge!(msg)
 						@@listeners.each { |l|
 							if l.is_a?(Thread)

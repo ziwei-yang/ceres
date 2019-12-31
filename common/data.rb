@@ -48,7 +48,6 @@ module URN
 		end
 
 		# Only support one algo now.
-		# Use algo work-thread wakeup() to notify.
 		# Very rare senario to run multi algos in one data source thread.
 		def drive(algo_class)
 			raise "@algo has been set" unless @algo.nil?
@@ -148,7 +147,6 @@ module URN
 		def _prepare_his_file
 			@market_pairs_files = {}
 			@market_pairs_fopen = {}
-			@redis_odbk_buffer = {}
 			@market_pairs.each do |m, p|
 				ramfiles = Dir["/mnt/ramdisk/#{m}_#{p}.*"].sort
 				macramfiles = Dir["/Volumes/RAMDisk/#{m}_#{p}.*"].sort
@@ -199,6 +197,7 @@ module URN
 			next_data_t = next_data[1].last
 			puts "next_data_t #{format_millisecond(next_data_t)}" if @debug
 			changed_trades = {}
+			changed_odbks = {}
 			odbk_changed = false
 			@next_data_frame.to_a.each do |mp, data|
 				m, p = mp
@@ -211,8 +210,7 @@ module URN
 					@next_data_frame[mp] = _io_read_next_frame(mp)
 					if type == "odbk\n"
 						@mgr.market_client(m).update_odbk(p, msg)
-						@redis_odbk_buffer[mp] ||= []
-						@redis_odbk_buffer[mp].push(msg)
+						changed_odbks[mp] = msg
 						odbk_changed = true
 					elsif type == "t\n"
 						@mgr.market_client(m).update_tick(p, msg)
@@ -222,17 +220,19 @@ module URN
 					end
 				end
 			end
-			if @algos
-				@algos.each do |alg|
-					alg.on_odbk(@redis_odbk_buffer) if odbk_changed
-					alg.on_tick(changed_trades) if changed_trades.size > 0
-				end
+			if @algo
+				@algo.on_odbk(changed_odbks) if odbk_changed
+				@algo.on_tick(changed_trades) if changed_trades.size > 0
 			end
-			@redis_odbk_buffer = {}
 		end
 
 		include URN::CLI
 		def start
+			if @algo.nil?
+				puts "HistoryMktDataSource start without algo".red
+			else
+				puts "HistoryMktDataSource start with #{@algo.name}"
+			end
 			_prepare_his_file()
 			ct = 0
 			history_start_t = @current_data_frame.values.first[1].last
@@ -248,7 +248,7 @@ module URN
 					speed_h = (history_span_hr/(end_t-start_t)).round(2)
 					speed_l = (seg_n/(end_t-seg_t)/1000).round
 					history_span_hr = history_span_hr.to_i
-					if @algos.nil? || @algos.empty?
+					if @algo.nil?
 						puts [
 							"#{(end_t-start_t).round}s",
 							ct.to_s,
@@ -256,9 +256,9 @@ module URN
 						 	"#{speed_h}/s",
 							"#{speed_l}K/s"
 						].join(', ')
-					elsif @algos.size == 1
-						stat = @algos[0].stat
-						name = @algos[0].name
+					else
+						stat = @algo.stat
+						name = @algo.name
 						filled_o = (stat[:filled_buy]||0) + (stat[:filled_sell]||0)
 						total_o = (stat[:dead_buy]||0) + (stat[:dead_sell]||0)
 						print [
@@ -271,16 +271,16 @@ module URN
 							"SL:#{stat[:stoploss_ct]}",
 							"fil:#{filled_o}/#{total_o}",
 							"tk:#{stat[:taker_ct]}",
+							"p:#{stat[:mkt_price]}",
 							"\n"
 						].join(' ')
-					else
-						puts "#{(end_t-start_t).round} s, #{ct}, #{history_span_hr} hrs, #{speed_h}/s"
 					end
 					seg_t = Time.now.to_f
 				end
 				ct += 1
 # 				break if ct == 50 # Fast test
 #  				break if ct == 5_000 # Fast test
+#  				break if ct == 50_000 # Fast test
 				_run_historical_files()
 			end
 			end_t = Time.now.to_f
@@ -288,17 +288,15 @@ module URN
 			history_span_hr = (history_end_t - history_start_t)/3600_000
 			speed_h = (history_span_hr/(end_t-start_t)).round(2)
 			puts "#{(end_t-start_t).round} s, #{ct} msg, #{history_span_hr} hrs, #{speed_h} hrs/s"
-			if @algos
-				stat_list = @algos.map do |alg|
-					stat = {:name=>alg.name}.merge(alg.stat())
-					puts JSON.pretty_generate(stat).blue
-					dir = "#{URN::ROOT}/output/#{alg.name}/"
-					FileUtils.mkdir_p dir
-					puts "Flush output to #{dir}"
-					alg.write_output(dir)
-					stat
-				end
-				return stat_list
+			if @algo
+				stat = {:name=>@algo.name}.merge(@algo.stat())
+				puts JSON.pretty_generate(stat).blue
+				dir = "#{URN::ROOT}/output/#{@algo.name}/"
+				FileUtils.mkdir_p dir
+				puts "Flush output to #{dir}"
+				@algo.write_output(dir)
+				stat
+				return [stat]
 			end
 			if @mgr
 				puts JSON.pretty_generate(@mgr.stat)

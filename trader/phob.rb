@@ -34,15 +34,17 @@ module URN
 		end
 
 		# Must overwrite methods.
-		# {[mkt, pair] => [bids, asks, t]}
-		def _process_odbk(changed_odbk)
-			_stat_inc(:odbk_update_ct)
-			odbk = changed_odbk[@mp]
-			return if odbk.nil?
-			return if _odbk_valid?(odbk) == false
-			@_latest_odbk = odbk
+		# [{[mkt, pair] => [bids, asks, t]}]
+		def _process_odbk_updates(changed_odbk_list)
+			changed_odbk_list.each { |changed_odbk|
+				_stat_inc(:odbk_update_ct)
+				odbk = changed_odbk[@mp]
+				next if odbk.nil?
+				next if _odbk_valid?(odbk) == false
+				@_latest_odbk = odbk
+			}
 		end
-		def _process_tick(ticks);end
+		def _process_tick_updates(ticks);end
 
 		def work
 			puts ['work() with debug: @_latest_odbk.nil?', @_latest_odbk.nil?] if @debug
@@ -58,7 +60,6 @@ module URN
 			puts [bid_price, bid_top_p, ask_top_p, ask_price] if @debug
 			need_place_buy = true
 			@buy_orders.each do |o|
-				next unless o['T'] == 'buy'
 				puts format_trade(o) if @debug
 				if o['p'] == bid_price
 					need_place_buy = false
@@ -70,7 +71,6 @@ module URN
 			need_place_sell = true
 			@sell_orders.each do |o|
 				puts format_trade(o) if @debug
-				next unless o['T'] == 'sell'
 				if o['p'] == ask_price
 					need_place_sell = false
 				else
@@ -84,13 +84,13 @@ module URN
 					if need_place_buy && o['p'] == bid_price
 						need_place_buy = false
 					else
-						# cancel pending order
+						cancel_pending_order_async(o)
 					end
 				elsif o['T'] == 'sell'
 					if need_place_sell && o['p'] == ask_price
 						need_place_sell = false
 					else
-						# cancel pending order
+						cancel_pending_order_async(o)
 					end
 				end
 			end

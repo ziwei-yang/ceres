@@ -26,10 +26,11 @@ module URN
 		def preprocess_deviation_evaluate(p); end
 
 		def place_order(pair, o, opt={})
-			o['status'] = 'new'
+			o['status'] = 'pending'
 			o['tif'] = opt[:tif]
 			@last_operation_time = o['t'] = @market_t
 			o['i'] = [(Time.now.to_f * 1000_000).to_i.to_s, rand(1000).to_s].join('_')
+			o['client_oid'] = "client_oid_#{o['i']}"
 			if o['v']
 				o['executed_v'] = 0.0
 				o['remained_v'] = o['v']
@@ -95,7 +96,7 @@ module URN
 			trade
 		end
 
-		def _mark_order_canceled(trade)
+		def _mark_order_canceled(trade, reason=nil)
 			trade['status'] = 'canceled'
 			order_status_evaluate(trade)
 			if trade['T'] == 'buy'
@@ -106,7 +107,7 @@ module URN
 				raise "Unknown trade type #{trade}"
 			end
 			@dead_orders.push trade
- 			puts "XX Order Canceled:\n#{format_trade(trade)}" if @verbose
+ 			puts "XX Order Canceled #{reason}:\n#{format_trade(trade)}" if @verbose
 			@listener_mgr.notify_order_canceled(trade)
 			trade
 		end
@@ -128,7 +129,7 @@ module URN
 				if o['status'] == 'canceling'
 					cancel_ms = now_ms - o['_cancel_init_t']
 					if cancel_ms >= @latency_ms
-						_mark_order_canceled(o)
+						_mark_order_canceled(o, 'as requested')
 						next
 					end
 				end
@@ -136,6 +137,7 @@ module URN
 				# Process pending orders.
 				alive_ms = now_ms - o['t']
 				next if alive_ms <= @latency_ms
+				o['status'] = 'new'
 
 				filled = false
 				if o['T'] == 'buy'
@@ -159,11 +161,13 @@ module URN
 				# Order could be filled.
 				if o['_first_match'] == true
 					if o['tif'] == 'PO' # PostOnly order failed.
-						_mark_order_canceled(o)
+						_mark_order_canceled(o, "post only #{bids[0]['p']} #{asks[0]['p']}")
 						next
 					else
-						o['taker'] = true
+						o['_dmy_taker'] = true
 					end
+				else
+					o['_dmy_taker'] = false
 				end
 
 				o['status'] = 'filled'
@@ -179,7 +183,7 @@ module URN
 			end
 			if @verbose
 				filled_orders.each do |o|
-					puts "   Order Filled - taker? #{o['taker']} buy #{@buy_orders.size} sell #{@sell_orders.size}:\n#{format_trade(o)}"
+					puts "   Order Filled - taker? #{o['_dmy_taker']} buy #{@buy_orders.size} sell #{@sell_orders.size}:\n#{format_trade(o)}"
 				end
 			end
 			return if filled_orders.empty?
@@ -213,10 +217,6 @@ module URN
 			@verbose = opt[:verbose] == true
 			@listeners = []
 		end
-		def client_register(client)
-			@trade_clients ||= []
-			@trade_clients.push(client)
-		end
 		def market_client(market, opt={})
 			market = market['market'] if market.is_a?(Hash) # Extract market from order.
 			@trade_clients ||= []
@@ -229,7 +229,8 @@ module URN
 				debug:@debug,
 				mgr:self # For receiving order updates.
 			)
-			client_register client
+			@trade_clients ||= []
+			@trade_clients.push(client)
 			return client
 		end
 
@@ -244,12 +245,15 @@ module URN
 		def balance_all(opt={})
 			puts "Do nothing in balance_all()"
 		end
+
+		def refresh_order(o, opt={})
+			market_client(o).query_order(o['pair'], o)
+		end
 		def refresh_orders(orders, opt={})
 			orders.map { |o| market_client(o).query_order(o['pair'], o) }
 		end
-		def cancel_orders(orders, opt={})
-			orders.map { |o| market_client(o).cancel_order(o['pair'], o) }
-		end
+
+		def monitor_order(trade); end
 		def cancel_order_async(trade, opt={})
 			if trade.is_a?(Array)
 				trade.each { |t| market_client(t).cancel_order(t['pair'], t) }
@@ -257,16 +261,20 @@ module URN
 				market_client(trade).cancel_order(trade['pair'], trade)
 			end
 		end
-		def place_orders(orders, opt={})
-			orders.map { |o| market_client(o).place_order(o['pair'], o, opt) }
-		end
-		def place_order(o, opt={})
-			market_client(o).place_order(o['pair'], o, opt)
+		def place_order_async(o, order_cache, opt={})
+			new_o = market_client(o).place_order(o['pair'], o, opt)
+			client_oid = new_o['client_oid']
+			# Make sure to put order under managed before request is created.
+			order_cache[client_oid] = new_o
+			# Order is pending now.
+			@listeners.each { |l| l.on_place_order_done(client_oid, new_o) }
+			client_oid
 		end
 
 		def stat
 			@trade_clients.map { |c| [c.market_name, c.stat] }.to_h
 		end
+
 		def print_stat
 			@trade_clients.map do |c|
 				puts c.market_name
