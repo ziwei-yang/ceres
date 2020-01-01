@@ -54,6 +54,7 @@ module URN
 				@vol_based = nil # true/false (@size_k == 'v')
 				@exec_k = nil # 'executed_v' # 'executed' for asset based market.
 				@stoploss_rate = 1.0 # default no stoploss
+				@_load_from_file = false
 			end
 
 			# All instance_variables starts with underline will not be saved.
@@ -93,6 +94,8 @@ module URN
 				}
 			}
 			@_helper_thread.priority = -3
+
+			@_data_stat_line = []
 		end
 
 		# Final setup and first run once connected to manager
@@ -104,6 +107,16 @@ module URN
 
 		def prepare
 			return if @_prepared
+
+			if @_load_from_file == false
+				if state_file_exist?
+					raise "state file exists, no more algo could be spawned"
+				else
+					puts "Save state for new spawned algo"
+					save_state_async()
+				end
+			end
+
 			@_prepared = true
 			# Force redirect all log in live mode.
 			# Logger would only allow one algo running to direct logs.
@@ -132,6 +145,29 @@ module URN
 			[@buy_orders, @sell_orders].each do |orders|
 				orders.each { |o| @mgr.monitor_order(o) }
 			end
+
+			# Rescue history errors.
+			[
+				@buy_orders,
+				@sell_orders,
+				@dead_buy_orders,
+				@dead_sell_orders,
+				@archived_buy_orders,
+				@archived_sell_orders
+			].each { |orders|
+				orders.each { |o|
+					begin
+						o['fee'].to_f
+					rescue => e
+						puts "order fee #{o['fee']} could not be coerced into float"
+						new_o = @mgr.query_order(o)
+						raise e if o['fee'] == new_o['fee']
+						puts "order fee #{o['fee']} recovered to #{new_o['fee']}"
+						o['fee'] = new_o['fee']
+						retry
+					end
+				}
+			}
 		end
 
 		# For live/dryrun mode, use work_thread to wait for data/trade updates
@@ -146,10 +182,17 @@ module URN
 				loop {
 					# During work(), new updates might come in.
 					# Always do process_updates() again after work()
+					cycle_t = Time.now.to_f
 					if process_updates()
 						work()
 						if @verbose
-							puts "#{@_stat_line.join(' ')} ", nohead:true, inline:true, nofile:true
+							cycle_t = ((Time.now.to_f - cycle_t)*1000).round(3)
+							@_stat_line.push("W #{cycle_t}")
+							if cycle_t > 1
+								puts "#{@_stat_line.join(' ')} ".red
+							else
+								puts "#{@_stat_line.join(' ')} ", nohead:true, inline:true, nofile:true
+							end
 						end
 					else
 						sleep()
@@ -186,7 +229,7 @@ module URN
 				return work()
 			end
 			@_odbk_updates.push(changed_odbk)
-			@_data_stat_line = opt[:stat_line]
+			@_data_stat_line = opt[:stat_line] || []
 			wakeup()
 		end
 		def _process_odbk_update(odbk)
@@ -200,7 +243,7 @@ module URN
 		# {[mkt, pair] => latest_trades}
 		def on_tick(latest_trades, opt={})
 			@_tick_updates.push(latest_trades)
-			@_data_stat_line = opt[:stat_line]
+			@_data_stat_line = opt[:stat_line] || []
 			wakeup()
 		end
 		def _process_tick_updates(trades)
@@ -297,7 +340,9 @@ module URN
 			end
 			return if found
 
-			raise "Unexpected order updates:\n#{format_trade(new_o)}"
+			# Sometimes old legacy updates would be received
+			puts "Unexpected order updates:\n#{format_trade(new_o)}".on_light_yellow
+			return
 		end
 
 		# Work thread : process odbk/tick/order updates before work()
@@ -344,11 +389,7 @@ module URN
 				_process_order(trade)
 			}
 			_organize_orders() if order_updated
-			if @_data_stat_line.nil?
-				@_stat_line = ['u', update_info.join(',')]
-			else
-				@_stat_line = @_data_stat_line + ['u', update_info.join(',')]
-			end
+			@_stat_line = @_data_stat_line + ['u', update_info.join(',')]
 			# Log large updates
 			puts @_stat_line.join(" ").red if @mode != :backtest && update_info.max > 1
 			return updated
@@ -534,7 +575,12 @@ module URN
 						raise "Unknown o['_dmy_taker'] #{o['_dmy_taker']}"
 					end
 				else
-					fee += o['fee']
+					raise "No fee in #{o.to_json}" if o['fee'].nil?
+					if o['fee'].is_a?(String)
+						fee += o['fee'].to_f
+					else
+						fee += o['fee']
+					end
 				end
 			}
 			sell_pos, sell_pos_cost = 0, 0
@@ -571,7 +617,12 @@ module URN
 						raise "Unknown o['_dmy_taker'] #{o['_dmy_taker']}"
 					end
 				else
-					fee += o['fee']
+					raise "No fee in #{o.to_json}" if o['fee'].nil?
+					if o['fee'].is_a?(String)
+						fee += o['fee'].to_f
+					else
+						fee += o['fee']
+					end
 				end
 			end
 			puts ['buy_pos', buy_pos, 'cost', buy_pos_cost] if @verbose
@@ -806,6 +857,11 @@ module URN
 			@_load_from_file = true
 		end
 
+		def state_file_exist?
+			return false if @mode == :backtest
+			data_dir = './trader_state/'
+			File.file?("#{data_dir}/#{@name}.json") || File.file?("#{data_dir}/#{@name}.json.gz")
+		end
 		def save_state_async
 			return if @mode == :backtest
 			@_should_save_state.push(true)
