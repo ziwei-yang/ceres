@@ -140,6 +140,7 @@ if __FILE__ == $0
 
 	if ARGV.size == 1 && File.file?(ARGV[0]) # Load from file.
 		algo = URN::PhobosOdbkAlgo.new(ARGV[0])
+		market_pairs = algo.market_pairs
 		opt = {
 			:mode => algo.mode,
 			:verbose => algo.verbose
