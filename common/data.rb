@@ -27,7 +27,8 @@ module URN
 			@market_clients = @market_pairs.to_a.map do |mp|
 				m, p = mp
 				# Listen orderbook only.
-				@redis_sub_channels["URANUS:#{m}:#{p}:full_odbk_channel"] = mp
+				@redis_sub_channels["URANUS:#{m}:#{p}:full_odbk_channel"] = [m, p, :odbk]
+				@redis_sub_channels["URANUS:#{m}:#{p}:full_tick_channel"] = [m, p, :tick]
 				c = nil
 				if @mode == :dryrun
 					puts "Initializing market #{m} #{p} for asset manager"
@@ -70,47 +71,75 @@ module URN
 			Thread.current.priority = 1
 			Thread.current[:name] = "DataSource #{@market_pairs} redis"
 			puts "Subscribing #{@redis_sub_channels.keys}"
+			@msg_t = nil
 			redis.subscribe(*(@redis_sub_channels.keys)) do |on|
 				on.subscribe { |chn, num| puts "Subscribed to ##{chn} (#{num} subscriptions)" }
 				on.message do |chn, msg| # TODO check if channle is orderbook or tick.
-					m, p = mp = @redis_sub_channels[chn]
+					m, p, type = mpt = @redis_sub_channels[chn]
+					mp = [m, p]
+
+					start_t = Time.now.to_f
+					msg_interval_t = (@msg_t.nil? ? 0 : (start_t - @msg_t)).round(3)
+					@msg_t = start_t
+					local_time_diff = 0
+					mkt_time_diff = 0
 
 					# Parse data, msg should contains all data.
-					start_t = Time.now.to_f
 					msg = parse_json(msg)
+
 					# Too much time cost here would lead data updates falling behind
-					data_chg = refresh_orderbooks(
-						[@market_client_map[m]],
-						[p],
-						@market_snapshot,
-						data: [msg],
-						no_real_p:true,
-						cache: @market_status_cache
-					)
-					cost_t = ((Time.now.to_f - start_t)*1000).round(3)
-					next unless data_chg
-					if @verbose
-						now = Time.now.to_f
+					changed_odbk = nil
+					new_mkt_trades = nil
+					if type == :odbk
+						data_chg = refresh_orderbooks(
+							[@market_client_map[m]],
+							[p],
+							@market_snapshot,
+							data: [msg],
+							no_real_p:true,
+							cache: @market_status_cache
+						)
+						next unless data_chg
 						changed_odbk = @market_snapshot[m][:orderbook]
 						bids, asks, t, mkt_t = changed_odbk
+						now = Time.now.to_f
 						local_time_diff = (now*1000 - t.to_f).round(3)
 						mkt_time_diff = (now*1000 - mkt_t.to_f).round(3)
-						@_stat_line = [
-							m.ljust(8),
-							'odbk', cost_t.to_s.ljust(6),
-							'lag', local_time_diff.to_s.ljust(6), mkt_time_diff.to_s.ljust(6)
-						]
-						if local_time_diff > 30 || mkt_time_diff > 60
-							puts @_stat_line.join(' ')
-						end
+					elsif type == :tick
+						trades, t = msg
+						new_mkt_trades = parse_new_market_trades(m, p, trades)
+						now = Time.now.to_f
+						local_time_diff = (now*1000 - t.to_f).round(3)
 					end
+
+					cost_t = ((Time.now.to_f - start_t)*1000).round(3)
+
+					# Prepare stat_line
+					@_stat_line = [
+						m, type,
+						cost_t.to_s[0..3].ljust(4),
+						local_time_diff.to_s[0..3].ljust(4)
+					]
+					if type == :odbk
+						@_stat_line.push(mkt_time_diff.to_s[0..3].ljust(4))
+						# @_stat_line.push("<#{msg_interval_t.to_s[0..3].ljust(4)}")
+						puts @_stat_line.join(' ') if local_time_diff > 30 || mkt_time_diff > 50
+					elsif type == :tick
+						@_stat_line.push("[#{new_mkt_trades.size}]")
+						# puts @_stat_line.join(' ')
+					end
+
+					return if @_should_exit
 
 					# Notify algo.
 					if @algo != nil
-						changed_odbk = @market_snapshot[m][:orderbook]
-						@algo.on_odbk({ mp => changed_odbk}, stat_line:@_stat_line)
+						if type == :odbk
+							@algo.on_odbk({mp => changed_odbk}, stat_line:@_stat_line)
+						elsif type == :tick
+							@algo.on_tick({mp => new_mkt_trades}, stat_line:@_stat_line)
+						end
 					else
-						puts "#{@_stat_line.join(' ')}    ", nohead:true, inline:true, nofile:true
+						puts "#{@_stat_line.join(' ')} ", nohead:true, inline:true, nofile:true
 					end
 				end
 				on.unsubscribe { |chn, num| raise "Unsubscribed to ##{chn} (#{num} subscriptions)" }
@@ -118,7 +147,27 @@ module URN
 		end
 
 		def start
-			_listen_redis()
+			Signal.trap("INT") {
+				puts "SIGINT caught"
+				@_should_exit = true
+			}
+
+			begin
+				_listen_redis()
+			rescue => e
+				puts e
+			end
+
+			if @algo != nil && @algo.mode == :live
+				puts "saving algo"
+				@algo.save_state_sync()
+				puts "printing algo"
+				@algo.print_info_sync()
+				3.times { |i| # Let other threads exit.
+					puts "data.start() would return in #{3-i}"
+					sleep 1
+				}
+			end
 		end
 	end
 
@@ -223,6 +272,7 @@ module URN
 			if @algo
 				@algo.on_odbk(changed_odbks) if odbk_changed
 				@algo.on_tick(changed_trades) if changed_trades.size > 0
+				@finished ||= @algo.should_end_backtest?
 			end
 		end
 
@@ -240,13 +290,14 @@ module URN
 			seg_t = Time.now.to_f
 			seg_n = 50_000
 			loop do
-				break if @finished
 				if ct % seg_n == 0
 					end_t = Time.now.to_f
 					history_end_t = @current_data_frame.values.first[1].last
 					history_span_hr = (history_end_t - history_start_t)/3600_000
-					speed_h = (history_span_hr/(end_t-start_t)).round(2)
-					speed_l = (seg_n/(end_t-seg_t)/1000).round
+					speed_h = '-'
+					speed_h = (history_span_hr/(end_t-start_t)).round(2) if end_t != start_t
+					speed_l = '-'
+					speed_l = (seg_n/(end_t-seg_t)/1000).round if end_t != seg_t
 					history_span_hr = history_span_hr.to_i
 					if @algo.nil?
 						puts [
@@ -287,6 +338,7 @@ module URN
 #  				break if ct == 5_000 # Fast test
 #  				break if ct == 50_000 # Fast test
 				_run_historical_files()
+				break if @finished
 			end
 			end_t = Time.now.to_f
 			history_end_t = @current_data_frame.values.first[1].last

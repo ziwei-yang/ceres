@@ -1269,7 +1269,7 @@ module URN
 				end
 				unless silent
 					req_t = ((Time.now - req_t)*1000).round(3)
-					puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms", level:2
+					puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms\n#{response}", level:2
 				end
 				return [response, proxy]
 			elsif @http_lib == :http
@@ -1290,11 +1290,12 @@ module URN
 					else
 						raise "Unknown http method: #{method}"
 					end
+					response = response.to_s
 					unless silent
 						req_t = ((Time.now - req_t)*1000).round(3)
-						puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms", level:4
+						puts "<-- #{@http_lib} #{method} #{display_args} #{req_t} ms\n#{response}", level:4
 					end
-					next [response.to_s, proxy]
+					next [response, proxy]
 				}
 			else
 				raise "Unknown http lib: #{@http_lib}"
@@ -3381,6 +3382,7 @@ module URN
 			elsif pair != nil && ARGV.size >= 4 && ['buy', 'sell'].include?(ARGV[1])
 				# Placing single new order manually.
 				order_args = {
+					'pair' => pair,
 					'T'	=> ARGV[1],
 					'p'	=> ARGV[2].to_f,
 					's' => ARGV[3].to_f
@@ -4174,6 +4176,7 @@ module URN
 		#
 		# Normally used when broadcast with full snapshot:
 		# if opt[:data] is given, data would be used directly but not from latest_orderbook()
+		# opt[:no_real_p] is enabled when opt[:data] is true
 		#
 		# Defensive code is removed because high frequency calling.
 		def refresh_orderbooks(mkt_clients, pair_list, snapshot, opt={})
@@ -4412,6 +4415,22 @@ module URN
 				next [trades, t]
 			end
 			trades_list
+		end
+
+		# Parse new market trades from broadcast data directly.
+		def parse_new_market_trades(market, pair, data)
+			return data.map { |trade|
+				trade['pair'] = pair
+				trade['market'] = market
+				trade['T'] = trade['T'].downcase
+				trade['s'] = trade['s'].to_f
+				trade['p'] = trade['p'].to_f
+				trade['executed'] = trade['s'].to_f
+				trade['remained'] = 0
+				trade['status'] = 'filled'
+				trade['t'] = DateTime.parse("#{trade['t']}+0800}").strftime('%Q')
+				trade
+			}
 		end
 	end
 end

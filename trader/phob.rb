@@ -158,9 +158,11 @@ if __FILE__ == $0
 
 	mds.drive(algo)
 
-	10.times { |i|
-		sleep 1
-		puts "Algo initialized, start data source in #{10-i}s"
-	}
+	if algo.mode == :live
+		10.times { |i|
+			sleep 1
+			puts "Algo initialized, start data source in #{10-i}s"
+		}
+	end
 	ret = mds.start()
 end

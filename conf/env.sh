@@ -39,7 +39,7 @@ export RUBY_VER='2.6.5'
 # http://engineering.appfolio.com/appfolio-engineering/2018/4/3/ruby-26-and-ahead-of-time-compilation
 [[ $RUBY_VER == 2.* ]] && \
 	export JRUBY_OPTS='' && \
-	export RUBYOPT='--jit --jit-min-calls=99999 --jit-max-cache=99999' && \
+	export RUBYOPT='--jit --jit-min-calls=999 --jit-max-cache=999' && \
 	export RUBYOPT=''
 
 export NODE_VER='12'

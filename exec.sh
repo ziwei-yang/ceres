@@ -12,6 +12,7 @@ need_log=0
 echo $basename
 if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'print_xfr.rb' ] || \
+	[ $basename == 'print_algo.rb' ] || \
 	[ $basename == 'trader_report.rb' ] || \
 	[ $basename == 'send_cmd.rb' ] || \
 	[ $basename == 'reload_active_progress.rb' ] || \
@@ -27,6 +28,7 @@ if [ $basename == 'print_legacy.rb' ] || \
 elif [ $basename == 'dmy.rb' ] || \
 	[ $basename == 'data.rb' ] || \
 	[ $basename == 'phob.rb' ] || \
+	[ $basename == 'eros.rb' ] || \
 	[ $basename == 'mars.rb' ] ; then
 	if [[ $@ == *live* ]]; then
 		source $DIR/conf/env.sh KEY
