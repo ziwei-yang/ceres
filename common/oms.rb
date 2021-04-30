@@ -4,22 +4,37 @@ module URN
 	# If listener is a Thread, wakeup() would be invoked.
 	# Otherwise listener.on_oms_broadcast(mkt, i, json_str) is called.
 	class OMSLocalCache
+		class << self
+			include APD::LogicControl
+			include URN::OrderUtil
+			include URN::Misc
+		end
+
 		@@_oms_broadcast_channels ||= {}
 		@@oms_local_cache ||= Concurrent::Hash.new
-		@@ready_markets ||= Concurrent::Hash.new
+		@@work_markets ||= Concurrent::Hash.new
+		@@inited_markets ||= Concurrent::Hash.new
 		@@listeners ||= Concurrent::Array.new
+		@@max_cache_size ||= Concurrent::Hash.new
+		@@current_cache_size ||= Concurrent::Hash.new
+		@@verbose = true
 
 		def self.redis
 			URN::RedisPool
 		end
 
-		def self.monitor(markets, listeners=[])
+		def self.log(*args)
+			puts *args if @@verbose != false
+		end
+
+		def self.monitor(markets, listeners=[], opt={})
+			@@verbose = opt[:verbose] == true
 			listeners.each { |l| add_listener(l) }
 
 			channels = []
 			started_markets = markets.select do |mkt|
 				if @@oms_local_cache[mkt] != nil
-					puts "OMSLocalCache is running for ##{mkt} already, skip".red
+					log "OMSLocalCache is running for ##{mkt} already, skip".red
 					next false
 				end
 				@@oms_local_cache[mkt] = Concurrent::Hash.new
@@ -33,17 +48,29 @@ module URN
 				t = Thread.new(abort_on_exception:true) {
 					Thread.current[:name] = "OMSLocalCache.listen #{started_markets}"
 					begin
-						_listen_oms(channels)
+						_listen_oms(channels, pair_prefix: opt[:pair_prefix])
 					rescue => e
 						APD::Logger.error e
 					end
 				}
 				t.priority = 3
-				puts "OMS cache started for #{started_markets}"
+				log "OMS cache started for #{started_markets}"
+			end
+
+			if opt[:wait] == true
+				markets.each { |m|
+					loop {
+						break if m == 'Bitstamp'
+						break if URN::OMSLocalCache.support_mkt?(m)
+						puts "Wait for #{m} OMS started"
+						sleep 1
+					}
+				}
 			end
 		end
 
 		def self.add_listener(l)
+			return if @@listeners.include?(l)
 			puts "OMSLocalCache listener added #{l.class.name}"
 			@@listeners.push l
 		end
@@ -58,46 +85,146 @@ module URN
 		end
 
 		def self.support_mkt?(market)
-			@@ready_markets[market] == true
+			@@work_markets[market] == true && @@inited_markets[market] == true
 		end
 
 		def self.oms_info(mkt, id)
 			@@oms_local_cache.dig(mkt, id)
 		end
 
-		def self._listen_oms(channels)
-			puts "<< OMS cache subscribing #{channels}"
+		# For mkt oms_order_write_if_null()
+		def self.oms_set_if_null(mkt, id, str)
+			if @@work_markets[mkt] == true
+				if @@oms_local_cache.dig(mkt, id).nil?
+					@@oms_local_cache[mkt][id] = str
+					log ">> write to OMSCache/#{mkt} #{id}".blue
+				end
+			end
+		end
+
+		# For mkt oms_order_delete()
+		def self.oms_delete(mkt, id)
+			if @@work_markets[mkt] == true
+				@@oms_local_cache[mkt].delete(id)
+				log ">> delete OMSCache/#{mkt} #{id}".red
+			end
+		end
+
+		# Could be run without start listening broadcast.
+		# Clear dead order with age older than 1 hour.
+		# Has bug with Future markets.
+		def self.clear_old_dead_orders
+			hash_names = endless_retry(sleep:1) {
+				redis.keys('URANUS*').select { |n| n =~ /^URANUS:[a-zA-Z].*:.*:O:/ }
+			}
+			clients = {}
+			hash_names.sort.each { |hash_name|
+				market_name = hash_name.split(':')[1]
+				if clients[market_name].nil?
+					next if URN.const_defined?(market_name) == false
+					puts "init #{market_name}"
+					clients[market_name] = URN.const_get(market_name).
+						new(verbose:false, skip_balance:true, trade_mode:'no')
+				end
+			}
+			keep_sleep 5
+			puts "Start cleaning old dead order from OMS cache"
+			keep_sleep 5
+			hash_names.sort.each { |hash_name|
+				market_name = hash_name.split(':')[1]
+				client = clients[market_name]
+				next if client.nil?
+				pair = hash_name.split(':')[4]
+				order_map = endless_retry(sleep:1) { redis.hgetall(hash_name) }
+				ct = 0
+				hdel_args = [hash_name]
+				order_map.each { |id, json|
+					next if id == 't'
+					json = JSON.parse(json)
+					begin
+						o = client.send(:_normalize_trade, pair, json)
+						if order_alive?(o) == false && order_age(o) > 3600*1000
+							ct += 1
+							hdel_args.push(id)
+							break if ct >= 99999 # Too long args would break stack.
+						end
+					rescue => e
+						APD::Logger.highlight "Error in processing #{hash_name} #{id}"
+					end
+				}
+				next if ct <= 0
+				puts "#{market_name} #{pair} : Deleting #{ct} tuples from #{order_map.size}"
+				endless_retry { redis.hdel(*hdel_args) }
+			}
+		end
+
+		def self._init_order_cache(chn, opt={})
+			mkt = @@_oms_broadcast_channels[chn] # {id:json_str}
+			oms_running = endless_retry(sleep:1) { redis.get("URANUS:#{mkt}:-:OMS") }
+			if oms_running.nil?
+				log "<< OMS #{mkt} OFF, skip _init_order_cache()".red
+				return
+			end
+
+			log "<< OMS cache #{mkt} init started #{opt}"
+			# Only care about pairs with those preix:
+			# Example: prefix USD-BTC -> USD-BTC, USD-BTC@20200626
+			pair_prefix = opt[:pair_prefix] || ''
+			prefix = "URANUS:#{mkt}:-:O:#{pair_prefix}"
+			hash_names = endless_retry(sleep:1) {
+				redis.keys('URANUS*').select { |n| n.start_with?(prefix) }
+			}
+			@@oms_local_cache[mkt].clear
+			pair_ct, order_ct, order_ct_map = 0, 0, {}
+			hash_names.each do |hash_name|
+				order_map = endless_retry(sleep:1) { 
+					log "redis.hgetall #{hash_name}"
+					redis.hgetall(hash_name)
+				}
+				t = order_map.delete('t')
+				if t.nil?
+					log "<< OMS cache #{mkt} no valid t for #{hash_name}, OMS ON, treat as active"
+				end
+				@@oms_local_cache[mkt].merge!(order_map)
+				@@work_markets[mkt] = true
+				pair_ct += 1
+				order_ct += order_map.size
+				order_ct_map[hash_name] = order_map.size
+			end
+			log "<< OMS cache #{mkt} init with #{pair_ct} pairs, #{order_ct} orders\n#{JSON.pretty_generate(order_ct_map)}"
+			@@inited_markets[mkt] = true
+			@@work_markets[mkt] = true
+			@@max_cache_size[mkt] = [2048, order_ct * 2].max
+			@@current_cache_size[mkt] = order_ct
+		end
+
+		def self._listen_oms(channels, opt={})
+			pair_prefix = opt[:pair_prefix] || ''
+			log "<< OMS cache subscribing #{channels}"
 			redis.subscribe(*channels) do |on|
 				on.subscribe do |chn, num|
-					puts "<< OMS cache subscribed to #{chn} (#{num} subscriptions)"
+					log "<< OMS cache subscribed to #{chn} (#{num} subscriptions)"
 					# Get full snapshot of orders
-					mkt = @@_oms_broadcast_channels[chn] # {id:json_str}
-					prefix = "URANUS:#{mkt}:-:O:"
-					hash_names = redis.keys('URANUS*').select { |n| n.start_with?(prefix) }
-					@@oms_local_cache[mkt].clear
-					hash_names.each do |hash_name|
-						order_map = redis.hgetall(hash_name)
-						t = order_map.delete('t')
-						if t.nil?
-							puts "<< OMS cache #{mkt} no valid t for #{hash_name}"
-						else
-							@@oms_local_cache[mkt].merge!(order_map)
-							puts "<< OMS cache #{mkt} init with #{hash_name} #{order_map.size} orders"
-							@@ready_markets[mkt] = true
-						end
-					end
+					_init_order_cache(chn, pair_prefix: pair_prefix)
 				end
 				on.message do |chn, msg|
 					begin
 						mkt = @@_oms_broadcast_channels[chn] # {id:json_str}
 						if msg == 'CLEAR' # Execute remote signal
-							puts "<< OMS cache #{mkt} signal: CLEAR".red
-							@@ready_markets[mkt] = false
+							log "<< OMS cache #{mkt} signal: CLEAR".red
+							@@work_markets[mkt] = false
+							@@inited_markets[mkt] = false
 							@@oms_local_cache[mkt].clear
 							next
 						end
+
+						# Cache would be enabled again.
+						_init_order_cache(chn, pair_prefix: pair_prefix) if @@work_markets[mkt] == false
+
 						msg = JSON.parse(msg)
-						# puts "<< OMS cache #{mkt} #{msg.keys}"
+						# log "<< OMS cache #{mkt} #{msg.keys}" if @@verbose
+						size = @@current_cache_size[mkt] || 0
+						msg.each { |k, v| size += 1 unless @@oms_local_cache[mkt].key?(k) }
 						@@oms_local_cache[mkt].merge!(msg)
 						@@listeners.each { |l|
 							if l.is_a?(Thread)
@@ -106,6 +233,18 @@ module URN
 								msg.each { |id, json| l.on_oms_broadcast(mkt, id, json) }
 							end
 						}
+
+						# Maintain @@oms_local_cache : just purge when size is too big.
+						max_size = @@max_cache_size[mkt]
+						if size >= max_size
+							log "<< OMS cache #{mkt} size #{size} >= #{max_size} PURGE triggered".red
+							@@work_markets[mkt] = false
+							@@inited_markets[mkt] = false
+							@@oms_local_cache[mkt].clear
+							_init_order_cache(chn, pair_prefix: pair_prefix)
+						else
+							@@current_cache_size[mkt] = size
+						end
 					rescue => e
 						APD::Logger.error e
 					end

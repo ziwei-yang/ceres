@@ -8,23 +8,46 @@ require 'timeout'
 require 'mail'
 require 'gli'
 require 'openssl'
-require 'http'
 require 'ecdsa'
 require 'oj' if RUBY_ENGINE == 'ruby'
 require 'securerandom'
 require 'http'
+require 'securerandom'
+require 'socksify/http'
+require 'lz4-ruby'
+require 'zlib'
+require 'selenium-webdriver'
+
+module RestClient
+	class Request
+		if instance_methods(false).include?(:net_http_object) == false
+			puts "RestClient::Request does not have :net_http_object"
+		elsif instance_methods(false).include?(:net_http_object_without_socksify) == false
+			# puts "Monkey patch: applying socks5 support for RestClient::Request"
+			def net_http_object_with_socksify(hostname, port)
+				p_uri = proxy_uri
+				if p_uri && p_uri.scheme =~ /^socks5?$/i
+					return Net::HTTP.SOCKSProxy(p_uri.hostname, p_uri.port).new(hostname, port)
+				end
+				net_http_object_without_socksify(hostname, port)
+			end
+			alias_method :net_http_object_without_socksify, :net_http_object
+			alias_method :net_http_object, :net_http_object_with_socksify
+		end
+	end
+end
 
 module URN
 	# Common functions here
 	def self.async(opt={}, &block)
 		name = opt[:name] || 'unamed'
-		puts "async #{name} invoked, thread prio #{Thread.current.priority}", level:2
+# 		puts "async #{name} invoked, thread prio #{Thread.current.priority}", level:2
 		Concurrent::Future.execute(executor: URN::CachedThreadPool) {
 			Thread.current.abort_on_exception = true
 			Thread.current[:name] = "_async " + name
-			puts ["async #{name} running", URN::CachedThreadPool.largest_length], level:3
+# 			puts ["async #{name} running", URN::CachedThreadPool.largest_length], level:3
 			ret = block.call()
-			puts ["async #{name} finished", URN::CachedThreadPool.largest_length], level:3
+# 			puts ["async #{name} finished", URN::CachedThreadPool.largest_length], level:3
 			ret
 		}
 	end
@@ -68,13 +91,34 @@ module URN
 				return JSON.parse(str)
 			end
 		end
+
+		# Keep sleeping even always waked up by other threads.
+		def keep_sleep(seconds)
+			until_t = Time.now.to_f + seconds
+			loop {
+				remained_t = until_t - Time.now.to_f
+				break if remained_t <= 0
+				sleep remained_t # Always waked up by other threads.
+			}
+		end
 	end
+
 	module MathUtil
 		def diff(f1, f2)
 			f1 = f1.to_f
 			f2 = f2.to_f
 			return 9999999 if [f1, f2].min <= 0
 			(f1 - f2) / [f1, f2].min
+		end
+
+		def stat_array(array)
+			return [0,0,0,0] if array.nil? || array.empty?
+			n = array.size
+			sum = array.reduce(:+)
+			mean = sum/n
+			deviation = array.map { |p| (p-mean)*(p-mean) }.reduce(:+)/n
+			deviation = Math.sqrt(deviation)
+			[n, sum, mean, deviation]
 		end
 
 		def format_num(f, float=8, decimal=8)
@@ -116,13 +160,24 @@ module URN
 			end
 		end
 
+		def parse_contract(contract)
+			segs = contract.split('@')
+			asset1, asset2, expiry = nil, nil, nil
+			raise "Invalid contract #{contract}" if segs.size > 2
+			expiry = segs[1] if segs.size == 2
+			segs = segs[0].split('-')
+			raise "Invalid contract #{contract}" if segs.size > 2
+			asset1, asset2 = segs
+			return [asset1, asset2, expiry]
+		end
+
 		def format_order(o)
 			o ||= {}
 			return "#{'-'.ljust(5)}#{format_num(o['p'].to_f, 10, 4)}#{format_num(o['s'].to_f)}" if o['T'].nil?
 			"#{o['T'].ljust(5)}#{format_num(o['p'].to_f, 10, 4)}#{format_num(o['s'].to_f)}"
 		end
 
-		def format_trade(t)
+		def format_trade(t, opt={})
 			return "Null trade" if t.nil?
 			s = nil
 			begin
@@ -137,8 +192,8 @@ module URN
 				]
 				if t['v'] != nil
 					# Print size for volume based order.
-					a[3] = format_num(t['executed_v'], 7, 1) + '/' + format_num(t['v'], 7, 1)
-					a.push("S:#{format_num(t['s'], 4, 2)}")
+					a[3] = format_num(t['executed_v'], 1, 7) + '/' + format_num(t['v'], 1, 7)
+					a.push("S:#{format_num(t['executed'], 4, 2)}")
 					# Also print expiry if pair contains it.
 					expiry = t['pair'].split('@')[1]
 					if expiry == 'P'
@@ -152,6 +207,9 @@ module URN
 				puts "Error in formatting:\n#{JSON.pretty_generate(t)}"
 				raise e
 			end
+			
+			s = "#{opt[:show]}: #{t[opt[:show]]}\n#{s}" if opt[:show] != nil
+
 			if t['T'].nil?
 				;
 			elsif t['T'].downcase == 'sell' || t['T'].downcase == 'ask'
@@ -170,7 +228,7 @@ module URN
 		def format_trade_time(t)
 			return 'no-time' if t.nil?
 			t = t.to_i + 8*3600*1000
-			DateTime.strptime(t.to_s, '%Q').strftime('%H:%M:%S %m/%d')
+			DateTime.strptime(t.to_s, '%Q').strftime('%H:%M:%S %y-%m-%d')
 		end
 
 		def format_millisecond(unix_mill)
@@ -265,7 +323,11 @@ module URN
 
 		def order_same?(o1, o2)
 			return false if o1['market'] != o2['market']
-			return false if o1['pair'] != o2['pair']
+			if o1['market'] == 'Gemini' && o2['market'] == 'Gemini' && (o1['pair'].nil? || o2['pair'].nil?)
+				; # Allow o1 / o2 without pair info, Gemini allow querying order without pair
+			else
+				return false if o1['pair'] != o2['pair']
+			end
 			if o1['T'] != nil && o2['T'] != nil
 				return false if o1['T'] != o2['T']
 			end
@@ -315,8 +377,9 @@ module URN
 		def order_stat(orders, opt={})
 			precise = opt[:precise] || 1
 			orders = [orders] if orders.is_a?(Hash)
-			# Consider cancelled order's size as executed
+			# Count cancelled order's executed part only in size_sum
 			orders_size_sum = orders.map do |o|
+				raise "error order, no size or executed\n#{o.to_json}" if o['s'].nil? || o['executed'].nil?
 				order_alive?(o) ? o['s'] : o['executed']
 			end.reduce(:+) || 0
 			orders_executed_sum = orders.map { |o| o['executed'] }.reduce(:+) || 0
@@ -431,39 +494,13 @@ module URN
 			loop do
 				begin
 					t = Thread.new do
-						email_plain_int(receiver, subject, content, bcc, opt)
+						APD::MailTask.email_plain(receiver, subject, content, bcc, opt)
 					end
 					return t
 				rescue ThreadError => e
 					sleep 1
 					retry if (e.message || '').include?('Resource temporarily unavailable')
 					raise e
-				end
-			end
-		end
-		def email_plain_int(receiver, subject, content, bcc = nil, opt={})
-			content ||= ""
-			content += File.read(opt[:html_file]) unless opt[:html_file].nil?
-			print "email_plain -> #{receiver} | #{subject} | content:#{content.size} attachment:#{opt[:file] != nil}\n"
-			Mail.deliver do
-				to      receiver
-				from    'Uranus <uranus@uranus.com>'
-				subject "#{subject} #{DateTime.now.strftime('%H:%M:%S')}"
-				html_part do
-					content_type 'text/html; charset=UTF-8'
-					body content
-				end
-				unless opt[:file].nil?
-					files = opt[:file]
-					files = files.split(",") if files.is_a?(String)
-					files = files.
-						map { |f| f.strip }.
-						select { |f| f.size > 0 }.
-						sort.
-						uniq
-					files.each do |f|
-						add_file f
-					end
 				end
 			end
 		end
@@ -479,7 +516,10 @@ module URN
 		def trader_status(pair)
 			pair = pair.upcase
 			keys = redis.keys "URANUS:orders:#{pair}*"
-			return {} if keys.empty?
+			if keys.empty?
+				puts "No redis keys forURANUS:orders:#{pair}*".red
+				return {}
+			end
 			raise "More than one key for pair #{pair}: #{keys}" unless keys.size == 1
 			key = keys.first
 			fields = redis.hkeys(key)
@@ -517,17 +557,10 @@ module URN
 
 		def active_exchanges(pair)
 			base, asset = pair_assets(pair)
-			file = "#{URN::ROOT}/task/arbitrage_#{asset.downcase}.sh"
 			if base == 'BTC'
-				;
-			elsif base == 'USDT'
-				file = "#{URN::ROOT}/task/arbitrage_usdt_#{asset.downcase}.sh"
-			elsif base == 'USD'
-				file = "#{URN::ROOT}/task/arbitrage_usd_#{asset.downcase}.sh"
-			elsif base == 'ETH'
-				file = "#{URN::ROOT}/task/arbitrage_eth_#{asset.downcase}.sh"
+				file = "#{URN::ROOT}/task/arbitrage_#{asset.downcase}.sh"
 			else
-				raise "No implemented"
+				file = "#{URN::ROOT}/task/arbitrage_#{base.downcase}_#{asset.downcase}.sh"
 			end
 			return [] unless File.file?(file)
 			File.read(file).
@@ -550,11 +583,86 @@ module URN
 		end
 	end
 
-	module CoinMarketUtil
+	module CoingeckoUtil
 		include APD::LogicControl
 		include APD::SpiderUtil
+		include APD::ExpireResult
+
+		COINGECKO_CACHE_T ||= 300
+
+		def coingecko_stat(opt={})
+			list = coingecko_list(opt)
+			btc_price = list.dig('BTC', 'price')
+			raise "No BTC price." if btc_price.nil?
+			map = {}
+			# Merge and sort by market cap, evaluate rank again.
+			list.values.
+				sort_by { |d| d['market_cap'] }.
+				reverse.each_with_index do |d, i|
+					d['price_btc'] = d['price'].to_f/btc_price
+					d['price_sat'] = (d['price_btc'].to_f * 100000000).to_i
+					d['24h_volume_usd'] = d.delete('volume')
+					d['24h_volume_btc'] = (d['24h_volume_usd'].to_f/btc_price).to_i
+					d['rank'] = i+1
+					map[d['name']] = d
+				end
+			map
+		end
+	
+		def coingecko_list(opt={})
+			coin_list = {}
+			(1..5).each do |i|
+				url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&per_page=250&page=#{i}"
+				coingecko_api_list(url, coin_list)
+			end
+			coin_list
+		end
+		expire_every COINGECKO_CACHE_T, :coingecko_list
+
+		def coingecko_api_list(url, coin_list, opt={})
+			response = endless_retry(sleep:5) { RestClient.get(url, accpet: :json) }
+			JSON.parse(response).each { |r|
+				name = r['symbol'] || raise("No symbol in #{r}")
+				name = name.upcase
+				full_name = r['name'] || raise("No name in #{r}")
+				price = r['current_price'] || raise("No current_price in #{r}")
+				rank = r['market_cap_rank'] || 99999
+				percent_change_24h = r['price_change_percentage_24h'] || 0
+				market_cap = r['market_cap'] || raise("No market_cap in #{r}")
+				volume = r['total_volume'] || raise("No total_volume in #{r}")
+
+				name = 'IOTA' if name == 'MIOTA'
+				# Only accept ATOM:Cosmos BTT:BitTorrent
+				next if name == 'ATOM' && full_name.include?('Cosmos')==false
+				next if name == 'BTT' && full_name.include?('BitTorrent') == false
+
+				if coin_list[name] != nil
+					# puts "Duplicate coin name #{coin_list[name]['full_name']} - #{cols[1]}"
+				elsif name =~ /^[A-Z0-9]{1,9}$/
+					coin_list[name] = {
+						'rank'	=> rank,
+						'name'	=> name,
+						'full_name'	=> full_name,
+						'market_cap'	=> market_cap,
+						'price'	=> price,
+						'volume'	=> volume,
+						'percent_change_24h'	=> percent_change_24h
+					}
+				else
+					# puts "Unknown coin name #{name.inspect}"
+				end
+			}
+		end
+	end
+
+	module CoinMarketUtil # Web parser outdated.
+		include APD::LogicControl
+		include APD::SpiderUtil
+		include APD::ExpireResult
+
+		COIN_MARKET_CACHE_T ||= 300
+
 		def coinmarket_stat_top99(opt={})
-			return @coin_stat if opt[:cache] != false && @coin_stat != nil
 			url = 'https://api.coinmarketcap.com/v1/ticker/?limit=0'
 			response = nil
 			endless_retry(sleep:5) { response = RestClient.get(url, accpet: :json) }
@@ -579,6 +687,7 @@ module URN
 			end
 			@coin_stat = coin_stat
 		end
+		expire_every COIN_MARKET_CACHE_T, :coinmarket_stat_top99
 
 		def coinmarket_stat(opt={})
 			token_map = coinmarket_token_list(opt)
@@ -609,30 +718,62 @@ module URN
 		def _coinmarket_parse_list(url, coin_list, opt={})
 			type = opt[:type]
 			raise "Unknown opt[:type] #{type}" if ['token', 'coin'].include?(type) == false
-			html = endless_retry(sleep:5) { parse_web(url) }
+			html = endless_retry(sleep:5) { parse_html(render_html(url, with: :firefox, render_t: 1)) }
+			# html = endless_retry(sleep:5) { parse_web(url, verbose:true, max_time: 10) }
+			# html = endless_retry(sleep:5) { parse_html(render_html(url, with: :phantomjs)) }
 			html.clone.xpath("//table/tbody/tr").each do |line|
-				cols = line.children.select { |c| c.name == 'td' }.
-					map { |c| c.text.strip }
-				if type == 'token' # Remove platform for token
-					cols = cols[0..1] + cols[3..-1]
+				el_list = line.children.select { |c| c.name == 'td' }
+				cols = el_list.map { |c| c.text.strip }
+				cols.each_with_index { |c, i| puts "#{i} [#{c}]" }
+				# 10/05-10:45:18.5068 .otstrap:649 0 []
+				# 10/05-10:45:18.5069 .otstrap:649 1 [1]
+				# 10/05-10:45:18.5069 .otstrap:649 2 [Tether1USDT]
+				# 10/05-10:45:18.5069 .otstrap:649 3 [$1.000.02%]
+				# 10/05-10:45:18.5070 .otstrap:649 4 [0.02%]
+				# 10/05-10:45:18.5070 .otstrap:649 5 [0.02%]
+				# 10/05-10:45:18.5070 .otstrap:649 6 [$15,633,962,967]
+				# 10/05-10:45:18.5070 .otstrap:649 7 [$31,344,598,03031,298,401,458 USDT]
+				# 10/05-10:45:18.5070 .otstrap:649 8 [15,610,921,182 USDT]
+				# 10/05-10:45:18.5071 .otstrap:649 9 []
+				# 10/05-10:45:18.5071 .otstrap:649 10 []
+				next if cols.nil? || cols.size < 9
+				next if cols[7].empty? # Empty line
+
+				rank = cols[1].to_i
+				name_str = cols[2].split(rank.to_s)
+				full_name = name_str[0]
+				name = name_str[1]
+				price_el = el_list[3]
+				if price_el.nil? # TODO
+					puts "Skip #{name} #{full_name}, no price element"
+					next
 				end
-				name = cols[5].split(' ')[1].strip
+				price = price_el.text.strip.gsub('$','').gsub(',','').to_f
+				percent_change_24h = cols[4].gsub('$','').gsub(',','').gsub('*','').to_f
+				percent_change_7d = cols[5].gsub('$','').gsub(',','').gsub('*','').to_f
+				market_cap = cols[6].gsub('$','').gsub(',','').gsub('*','').to_i
+				volume = el_list[7].
+					children.find { |c| c.name == 'div' }.
+					children.find { |c| c.name == 'a' }.
+					text.strip.gsub('$','').gsub(',','').to_i
+
 				name = 'IOTA' if name == 'MIOTA'
+				# Only accept ATOM:Cosmos BTT:BitTorrent
+				next if name == 'ATOM' && full_name.include?('Cosmos')==false
+				next if name == 'BTT' && full_name.include?('BitTorrent') == false
+
 				if coin_list[name] != nil
 					# puts "Duplicate coin name #{coin_list[name]['full_name']} - #{cols[1]}"
 				elsif name =~ /^[A-Z0-9]{1,9}$/
-					# Only accept ATOM:Cosmos BTT:BitTorrent
-					next if name == 'ATOM' && (cols[1]||'').include?('Cosmos')==false
-					next if name == 'BTT' && cols[1].include?('BitTorrent') == false
 					coin_list[name] = {
 						'type'	=> type,
-						'rank'	=> cols[0].to_i,
+						'rank'	=> rank,
 						'name'	=> name,
-						'full_name'	=> cols[1],
-						'market_cap'	=> cols[2].gsub('$','').gsub(',','').gsub('*','').to_i,
-						'price'	=> cols[3].gsub('$','').gsub(',','').gsub('*','').to_f,
-						'volume'	=> cols[4].gsub('$','').gsub(',','').gsub('*','').to_f,
-						'percent_change_24h'	=> cols[6].gsub('%','').gsub(',','').gsub('*','').to_f
+						'full_name'	=> full_name,
+						'market_cap'	=> market_cap,
+						'price'	=> price,
+						'volume'	=> volume,
+						'percent_change_24h'	=> percent_change_24h
 					}
 				else
 					# puts "Unknown coin name #{name.inspect}"
@@ -641,26 +782,24 @@ module URN
 		end
 	
 		def coinmarket_coin_list(opt={})
-			return @_coinmarket_coin_list unless @_coinmarket_coin_list.nil?
 			coin_list = {}
 			(1..5).each do |i|
 				url = "https://coinmarketcap.com/coins/#{i}/"
 				_coinmarket_parse_list(url, coin_list, type:'coin')
 			end
-			@_coinmarket_coin_list = coin_list
-			@_coinmarket_coin_list
+			coin_list
 		end
+		expire_every COIN_MARKET_CACHE_T, :coinmarket_coin_list
 	
 		def coinmarket_token_list(opt={})
-			return @_coinmarket_token_list unless @_coinmarket_token_list.nil?
 			token_list = {}
 			(1..5).each do |i|
 				url = "https://coinmarketcap.com/tokens/#{i}/"
 				_coinmarket_parse_list(url, token_list, type:'token')
 			end
-			@_coinmarket_token_list = token_list
-			@_coinmarket_token_list
+			token_list
 		end
+		expire_every COIN_MARKET_CACHE_T, :coinmarket_token_list
 	end
 end
 
@@ -684,7 +823,9 @@ unless defined? URN::BOOTSTRAP_LOAD_STARTED
 	URN::CachedThreadPool = Concurrent::CachedThreadPool.new(idletime:2147483647)
 	# Set available redis pool num to zero, so it would not always connect even not needed.
 	URN::RedisPool = APD::TransparentGreedyPoolProxy.new(
-		APD::GreedyRedisPool.new(0, redis_db:0, warn_time:0.005)
+		APD::GreedyRedisPool.new(0, redis_db:0, warn_time:0.005, warn_stack:6)
 	)
+	# Example to suppress most redis pool warning.
+	# URN::RedisPool.pool.warn_time = 1.0
 	URN::BOOTSTRAP_LOAD = true
 end

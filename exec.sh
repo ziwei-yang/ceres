@@ -13,23 +13,25 @@ echo $basename
 if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'print_xfr.rb' ] || \
 	[ $basename == 'print_algo.rb' ] || \
+	[ $basename == 'print_state.rb' ] || \
 	[ $basename == 'trader_report.rb' ] || \
 	[ $basename == 'send_cmd.rb' ] || \
 	[ $basename == 'reload_active_progress.rb' ] || \
 	[ $basename == 'reload_legacy_progress.rb' ] || \
 	[ $basename == 'future_spot.rb' ] || \
 	[ $basename == 'fix_state.rb' ] || \
+	[ $basename == 'quickfix.rb' ] || \
 	[ $basename == 'save_mkt.rb' ] || \
 	[ $basename == 'filter.rb' ] || \
+	[ $basename == 'api.rb' ] || \
 	[ $basename == 'test.rb' ] || \
 	[ $basename == 't.rb' ] ; then
 	source $DIR/conf/dummy_env.sh
 	source $DIR/conf/env.sh
 elif [ $basename == 'dmy.rb' ] || \
 	[ $basename == 'data.rb' ] || \
-	[ $basename == 'phob.rb' ] || \
-	[ $basename == 'eros.rb' ] || \
-	[ $basename == 'mars.rb' ] ; then
+	[[ $file == trader/*.rb ]] || \
+	[[ $file == signal/*.rb ]] ; then
 	if [[ $@ == *live* ]]; then
 		source $DIR/conf/env.sh KEY
 		echo "For live HFT algos, enable logs"
@@ -48,7 +50,7 @@ else
 fi
 shift
 
-rm $DIR/Gemfile.lock
+rm -f $DIR/Gemfile.lock
 if [[ $need_log == 0 ]]; then
 	ruby $file $@
 else

@@ -5,7 +5,8 @@ module URN
 		include URN::CLI
 		include URN::OrderUtil
 		include APD::LockUtil
-		attr_reader :market_pairs, :stat, :name, :verbose, :mode, :_stat_line, :mgr
+		attr_reader :market_pairs, :stat, :name, :verbose, :mode, :_stat_line, :mgr, :position, :maker_size
+		attr_accessor :_stat_output_dir
 
 		def initialize(market_pairs, opt={})
 			if market_pairs.is_a?(String)
@@ -193,15 +194,19 @@ module URN
 					# Always do process_updates() again after work()
 					cycle_t = Time.now.to_f
 					if process_updates()
-						@_stat_line_keep_log = false
+						@_stat_line_keep_log = nil
 						work()
 						if @verbose
 							cycle_t = ((Time.now.to_f - cycle_t)*1000).round(3)
 							@_stat_line.push("W #{cycle_t}")
 							if cycle_t > 1
-								puts "#{@_stat_line.join(' ')} ".yellow
-							elsif @_stat_line_keep_log == true
-								puts "#{@_stat_line.join(' ')} ".light_magenta
+								puts "SL-AG #{@_stat_line.join(' ')} ".yellow
+							elsif @_stat_line_keep_log != nil
+								if @_stat_line_keep_log == true
+									puts "#{@_stat_line.join(' ')} ".light_magenta
+								else # Also record reason of keeping log.
+									puts "#{@_stat_line_keep_log} #{@_stat_line.join(' ')} ".light_magenta
+								end
 							else
 								puts "#{@_stat_line.join(' ')} ".light_red, nohead:true, inline:true, nofile:true
 							end
@@ -244,6 +249,62 @@ module URN
 		end
 
 		################################################
+		# Signal Stat
+		################################################
+		def signal_stat_init(signal_names)
+			# Prepare signal stat file.
+			@_stat_output_dir ||= "#{URN::ROOT}/output/"
+			FileUtils.mkdir_p(@_stat_output_dir)
+			@_stat_f = "#{@_stat_output_dir}/#{@name}.#{@mode}.stat.txt.gz"
+			puts "Signal stat file: #{@_stat_f}"
+			@_stat_w = Zlib::GzipWriter.open("#{@_stat_f}")
+			his_length_list = [10, 30, 60, 300] # in seconds
+			@_stat_history_list = his_length_list.map { |l|
+				# One more bucket to make sure time diff >= required
+				APD::TimeSeriesBucket.new(l*1000/10, 11)
+			}
+			# write headline
+			headline = ["market_timestamp", "price"] + his_length_list.map { |l|
+				["tDif#{l}", "pDif#{l}"] + signal_names.map { |n|
+					"#{n}#{l}"
+				}
+			}
+			@_stat_w.puts(headline.join("\t"))
+			@_stat_empty_seg = ['-', '-'] + signal_names.map { '-' }
+		end
+
+		def signal_stat_record(mkt_t, price, signal_names, signal_list)
+			signal_stat_init(signal_names) if @_stat_w.nil?
+
+			# Save current signal for future writing.
+			@_stat_history_list.each { |his|
+				his.append(mkt_t, [mkt_t, price, signal_list])
+			}
+
+			# Write saved oldest stat data and current market data.
+			line = [mkt_t, price]
+			all_data_missing = true
+			@_stat_history_list.each { |his|
+				old_stat_data = his.shift
+				if old_stat_data.nil?
+					line.concat(@_stat_empty_seg)
+				else
+					all_data_missing = false
+					old_mkt_t, old_p, old_signals = old_stat_data
+					time_diff = ((mkt_t-old_mkt_t)/1000).round(1) # in second
+					p_diff = price - old_p
+					line.push(time_diff, p_diff)
+					line.concat(old_signals)
+				end
+			}
+			@_stat_w.puts(line.join("\t")) unless all_data_missing
+		end
+
+		def signal_stat_finish
+			@_stat_w.close unless @_stat_w.nil?
+		end
+
+		################################################
 		# Events
 		################################################
 		# Invoked by data source.
@@ -268,7 +329,7 @@ module URN
 		# {[mkt, pair] => latest_trades}
 		def on_tick(latest_trades, opt={})
 			if @mode == :backtest # Boost for backtest mode
-				_process_tick_updates(latest_trades)
+				_process_tick_update(latest_trades)
 				return work()
 			end
 			@_tick_updates.push(latest_trades)
@@ -282,16 +343,16 @@ module URN
 		# Invoked by OMS updates listener, after placing order.
 		def on_place_order_done(client_oid, trade)
 			@_misc_updates.push([:place_order_done, client_oid, trade])
-			wakeup()
+			wakeup() if @mode != :backtest
 		end
 		def on_place_order_rejected(client_oid, e=nil)
 			@_misc_updates.push([:place_order_rejected, client_oid, e])
-			wakeup()
+			wakeup() if @mode != :backtest
 		end
 		def _process_misc_update(data)
 			if data[0] == :place_order_done
 				type, client_oid, trade = data
-				puts "place_order_done #{client_oid} -> #{trade['i']}\n#{format_trade(trade)}" if @mode != :backtest
+				puts "place_order_done #{client_oid} -> #{trade['i']}\n#{format_trade(trade)}" if @verbose || @mode != :backtest
 				order = @pending_orders.delete(client_oid)
 				return(puts("@pending_orders has no such record")) if order.nil?
 				(trade['T'] == 'buy' ? @buy_orders : @sell_orders).push(trade)
@@ -380,7 +441,7 @@ module URN
 			updated = false
 			order_updated = false
 			update_info = [0,0,0,0]
-			@debug = false # Set debug=true here
+			# @debug = false # Set debug=true here
 
 			new_odbk_list = []
 			loop {
@@ -421,7 +482,7 @@ module URN
 			if @mode != :backtest
 				@_stat_line = @_data_stat_line + [update_info.join(',')]
 				# Log large updates
-				@_stat_line_keep_log = true if update_info.max > 1
+				@_stat_line_keep_log = 'UPDTE' if update_info.max > 1
 			end
 			return updated
 		end
@@ -435,6 +496,19 @@ module URN
 			return if stoploss_o.nil?
 			puts "Stoploss order update\n#{format_trade(stoploss_o)}\n#{format_trade(trade)}" if @mode != :backtest
 			trade.each { |k, v| stoploss_o[k] = v }
+		end
+
+		# Often used in signal backtesting.
+		# Example: Only record signal when top price changed.
+		def _top_price_changed?(odbk)
+			bids, asks, t, mkt_t = odbk
+			if @_last_top_bid_p == bids[0]['p'] && @_last_top_ask_p == asks[0]['p']
+				return false
+			else
+				@_last_top_bid_p = bids[0]['p']
+				@_last_top_ask_p = asks[0]['p']
+				return true
+			end
 		end
 
 		def _odbk_valid?(odbk)
@@ -463,12 +537,12 @@ module URN
 
 			buy_delete_ct = 0
 			@buy_orders.delete_if { |o|
-				puts [format_trade(o), order_alive?(o), @exec_k, o[@exec_k]].join if @debug
+				# puts [format_trade(o), order_alive?(o), @exec_k, o[@exec_k]].join if @debug
 				if order_alive?(o)
 					open_buy_pos += (o[@size_k]-o[@exec_k])
 					next false
 				end
-				_stat_inc(:dead_buy)
+				_stat_inc(:dead_buy_orders)
 				buy_delete_ct += 1
 				@dead_buy_orders.push o
 				next true if o[@exec_k] == 0
@@ -478,12 +552,12 @@ module URN
 
 			sell_delete_ct = 0
 			@sell_orders.delete_if { |o|
-				puts [format_trade(o), order_alive?(o), @exec_k, o[@exec_k]].join if @debug
+				# puts [format_trade(o), order_alive?(o), @exec_k, o[@exec_k]].join if @debug
 				if order_alive?(o)
 					open_sell_pos += (o[@size_k]-o[@exec_k])
 					next false
 				end
-				_stat_inc(:dead_sell)
+				_stat_inc(:dead_sell_orders)
 				sell_delete_ct += 1
 				@dead_sell_orders.push o
 				next true if o[@exec_k] == 0
@@ -530,13 +604,13 @@ module URN
 					next
 				end
 				# Order is filled.
-				if order_same?(o, @latest_stoploss_order)
+				if @latest_stoploss_order != nil && order_same?(o, @latest_stoploss_order)
 					puts "Last stoploss order filled\n#{format_trade(o)}" if @verbose
-					_stat_inc(:stoploss_ct)
+					_stat_inc(:stoploss_fill_latest)
 				else
 					# This would affect in on_new_filled_orders() for new pnl and pos.
 					puts "oops, history stoploss order is filled\n#{format_trade(o)}" if @verbose
-					_stat_inc(:his_stoploss_ct)
+					_stat_inc(:stoploss_fil_his)
 				end
 				@stoploss_orders.delete(o['client_oid'])
 			}
@@ -555,13 +629,14 @@ module URN
 
 			if @verbose
 				puts "New filled orders:"
-				new_filled_orders.each { |o| puts format_trade(o) }
+				new_filled_orders.each { |o| puts format_trade(o), nohead:true }
 				puts "position after filled: #{@position}"
 			end
 
 			on_new_filled_orders(new_filled_orders)
-			compute_pnl() if @mode != :backtest # compute_pnl mannully in backtesting
+			compute_pnl()
 			print_info_async() if @verbose
+			get_input prompt:"Press enter to continue" if @debug
 		end
 
 		# Could be overwritten by sub-class
@@ -576,6 +651,7 @@ module URN
 			fee = 0
 			taker_ct = 0
 			buy_pos, buy_pos_cost = 0, 0
+			unclosed_position_t = nil
 			# From latest to oldest.
 			(@archived_buy_orders + @dead_buy_orders).reverse.each { |o|
 				p, s = o['p'], o[@exec_k]
@@ -583,6 +659,7 @@ module URN
 				cost = (@vol_based ? (s/p.to_f) : (s*p.to_f))
 				size = 0 # Size for realized PNL
 				if last_pos > 0 # Unprocessed unrealized position
+					unclosed_position_t ||= o['t']
 					if last_pos > s # Order is in last pos.
 						last_pos -= s
 						unrealized_cost += cost
@@ -625,6 +702,7 @@ module URN
 				cost = (@vol_based ? (s/p.to_f) : (s*p.to_f))
 				size = 0 # Size for realized PNL
 				if last_pos < 0 # Unprocessed unrealized position
+					unclosed_position_t ||= o['t']
 					if last_pos < 0-s # Order is in last pos.
 						last_pos += s
 						unrealized_cost += cost
@@ -663,17 +741,22 @@ module URN
 			puts ['sell_pos', sell_pos, 'cost', sell_pos_cost] if @verbose
 			if @position == 0
 				@avg_price = nil
+				@position_t_ms = nil
 			elsif @vol_based
 				@avg_price = (@position/unrealized_cost).abs
+				@position_t_ms = unclosed_position_t
 			else
 				@avg_price = (unrealized_cost/@position).abs
+				@position_t_ms = unclosed_position_t
 			end
 			if @position == 0
 				@stoploss_price = nil
 			elsif @position > 0 # Long pos
-				@stoploss_price = @avg_price*(1-@stoploss_rate)
+				@stoploss_price = @avg_price*(1-(@stoploss_rate/(@position.abs/@maker_size)))
+				# @stoploss_price = @avg_price*(1-@stoploss_rate)
 			else # Short position
-				@stoploss_price = @avg_price*(1+@stoploss_rate)
+				@stoploss_price = @avg_price*(1+(@stoploss_rate/(@position.abs/@maker_size)))
+				# @stoploss_price = @avg_price*(1+@stoploss_rate)
 			end
 			puts [
 				'pos', @position,
@@ -693,10 +776,6 @@ module URN
 			# see -> def should_end_backtest?
 			@stat[:should_end_backtest] = true if @mode == :backtest && pnl < -0.3
 			@stat[:pos] = @position
-			@stat[:pending_orders] = @pending_orders.size
-			@stat[:canceling_orders] = @canceling_orders.values.map { |a| a.size }.reduce(:+)
-			@stat[:buy_orders] = @buy_orders.size
-			@stat[:sell_orders] = @sell_orders.size
 			@stat[:dead_buy_orders] = @dead_buy_orders.size
 			@stat[:dead_sell_orders] = @dead_sell_orders.size
 			@stat[:archived_buy_orders] = @archived_buy_orders.size
@@ -711,7 +790,12 @@ module URN
 		# Max same price & type order in pending order is 1.
 		# Return client_oid if order would be placed
 		def place_order_async(order, max_same_pending=1, opt={})
-			return if @mode == :dryrun
+			reason = opt.delete(:reason)
+			if @mode == :dryrun
+				return
+			elsif @mode == :backtest
+				raise "No reason to place order" if reason.nil?
+			end
 			if order[@size_k] <= 0
 				puts "Invalid order #{order}".red
 				return nil
@@ -724,16 +808,19 @@ module URN
 				puts "place order intention rejected, max_same_pending #{max_same_pending} reached"
 				return nil
 			end
-
 			old_priority = Thread.current.priority
 			Thread.current.priority = 3
 			opt[:allow_fail] = true # Force allowing fail.
-			puts "Placing order\n#{format_trade(order)}".blue if @verbose
+			if @verbose
+				str = "Placing order #{@pending_orders} reason:#{reason}".blue
+				puts "#{str}\n#{@_reason_info}\n#{format_trade(order)}"
+			end
 			client_oid = @mgr.place_order_async(order, @pending_orders, opt)
 			Thread.current.priority = old_priority
 			# Pending orders should contains client_oid now
 			save_state_async()
 			@_order_place_t = Time.now.to_f
+			@_stat_line_keep_log = 'PLACE'
 			return client_oid
 		end
 		thread_safe :place_order_async # In case of duplicated @pending_orders
@@ -748,7 +835,7 @@ module URN
 			else
 				@canceling_orders[orders['market']][orders['i']] = orders
 			end
-			@_stat_line_keep_log = true
+			@_stat_line_keep_log = 'CANCL'
 			@mgr.cancel_order_async(orders)
 			Thread.current.priority = old_priority
 		end
@@ -792,9 +879,10 @@ module URN
 				end
 			end
 			return nil if dup == true
-			@_stat_line_keep_log = true
+			@_stat_line_keep_log = 'STPLS'
 			puts "Placing stoploss order\n#{format_trade(order)}".on_light_yellow if @verbose
-			client_oid = place_order_async(order, opt)
+			opt[:reason] = "stoploss"
+			client_oid = place_order_async(order, 1, opt)
 			return nil if client_oid.nil?
 			order = @pending_orders[client_oid]
 			if order.nil?
@@ -802,16 +890,16 @@ module URN
 				puts "Order #{client_oid} is not in @pending_orders"
 				raise "Order #{client_oid} is not in @pending_orders"
 			end
-			@stoploss_orders[client_oid] = order
-			puts "New stoploss order added #{client_oid}"
+			@latest_stoploss_order = @stoploss_orders[client_oid] = order
+			puts "New stoploss order added #{client_oid}" if @verbose || (@mode != :backtest)
 			client_oid
 		end
 
 		###############################################
 		# Generate output file
 		###############################################
-		def write_output(dir)
-			puts "Nothing to be flush into #{dir}"
+		def finish
+			signal_stat_finish()
 		end
 
 		################################################
@@ -851,7 +939,7 @@ module URN
 
 			if @stoploss_orders.empty? == false
 				logs.push("Stoploss orders:".red)
-				logs.concat(@stoploss_orders.map { |o| format_trade(o) })
+				logs.concat(@stoploss_orders.map { |client_oid, o| format_trade(o) })
 			end
 
 			logs.push("Dead orders:")
@@ -973,6 +1061,9 @@ module URN
 	end
 
 	module AlgoCLILoader
+		class << self
+			include Parallel::ProcessorCount
+		end
 		def self.boot(algo_class, cli_args, market_pairs=nil)
 			return batch_test(algo_class, cli_args, market_pairs) if cli_args.include?('batch')
 
@@ -1002,6 +1093,7 @@ module URN
 					raise "Unknown mode #{opt_algo}"
 				end
 				puts ('#'*50)
+				puts opt_algo
 				algo = algo_class.new(market_pairs, opt_algo)
 			end
 
@@ -1009,11 +1101,22 @@ module URN
 			mds = nil
 			if opt_algo[:mode] == :backtest
 				file_args = cli_args[0] # Remained CLI args are file filters
+				# Filter start_time string
+				start_time = cli_args.select { |s| s =~ /^[0-9]{8,14}$/ }.first
+				if start_time != nil
+					cli_args -= [start_time]
+					start_time = DateTime.parse(start_time.ljust(14, '0') + " +0800")
+					puts "Start from time #{start_time}"
+					start_time = start_time.strftime('%Q').to_i
+					puts "Start from time #{start_time}"
+				end
 				mds = URN::HistoryMktDataSource.new(
 					market_pairs,
 					verbose: opt_algo[:verbose],
-					file_filter: file_args
+					file_filter: file_args,
+					start_time: start_time
 				)
+				algo._stat_output_dir = "#{URN::ROOT}/output/#{mds.filename()}"
 			else
 				mds = URN::MktDataSource.new(
 					market_pairs,
@@ -1059,15 +1162,18 @@ module URN
 			return [cli_args, opt]
 		end
 
-		include Parallel::ProcessorCount
-		def batch_test(algo_class, option_list, cli_args, market_pairs=nil)
+		def self.batch_test(algo_class, option_list, cli_args, market_pairs=nil)
 			processors = processor_count()/2-1 # Keep one core
 			puts "Run #{algo_class} Bot in batch mode"
 			algos = option_list.map { |opt| algo_class.new(market_pairs, opt) }
 			cli_args -= ['batch']
 			file_args = cli_args[0] # Remained CLI args are file filters
 			stat_map = Parallel.map(algos, in_processes:processors) do |alg|
-				mds = URN::HistoryMktDataSource.new(market_pairs, file_filter: file_args)
+				mds = URN::HistoryMktDataSource.new(
+					market_pairs,
+					file_filter: file_args
+				)
+				alg._stat_output_dir = "#{URN::ROOT}/output/#{mds.filename()}"
 				mds.drive(alg)
 				stat_list = mds.start()
 				puts "#{alg.name} finished"

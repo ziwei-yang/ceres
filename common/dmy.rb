@@ -30,6 +30,7 @@ module URN
 			o['tif'] = opt[:tif]
 			@last_operation_time = o['t'] = @market_t
 			o['i'] = [(Time.now.to_f * 1000_000).to_i.to_s, rand(1000).to_s].join('_')
+			o['i'] += "_#{o['tif']}" if o['tif'] != nil
 			o['client_oid'] = "client_oid_#{o['i']}"
 			if o['v']
 				o['executed_v'] = 0.0
@@ -92,7 +93,7 @@ module URN
 			# Only mark trade as canceling.
 			trade['_cancel_init_t'] = @last_operation_time = @market_t
 			trade['status'] = 'canceling'
- 			puts "-- Order Cancel request:\n#{format_trade(trade)}" if @verbose
+ 			puts "-- Order Cancel request: #{format_trade_time(@market_t)}\n#{format_trade(trade)}" if @verbose
 			trade
 		end
 
@@ -107,7 +108,7 @@ module URN
 				raise "Unknown trade type #{trade}"
 			end
 			@dead_orders.push trade
- 			puts "XX Order Canceled #{reason}:\n#{format_trade(trade)}" if @verbose
+ 			puts "XX Order Canceled #{reason}: #{format_trade_time(@market_t)}\n#{format_trade(trade)}" if @verbose
 			@listener_mgr.notify_order_canceled(trade)
 			trade
 		end
@@ -173,6 +174,7 @@ module URN
 				end
 
 				o['status'] = 'filled'
+				o['t'] = @market_t # Update filled order time with market time
 				if o['v']
 					o['executed_v'] = o['v']
 					o['remained_v'] = 0.0
@@ -185,7 +187,7 @@ module URN
 			end
 			if @verbose
 				filled_orders.each do |o|
-					puts "   Order Filled - taker? #{o['_dmy_taker']} buy #{@buy_orders.size} sell #{@sell_orders.size}:\n#{format_trade(o)}"
+					puts "   Order Filled - #{format_trade_time(@market_t)} taker? #{o['_dmy_taker']} buy #{@buy_orders.size} sell #{@sell_orders.size}:\n#{format_trade(o)}"
 				end
 			end
 			return if filled_orders.empty?
