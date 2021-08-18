@@ -3,6 +3,10 @@ export OS=$( uname )
 
 export URANUS_ENV_VER='20200219'
 
+export REDIS_HOST='127.0.0.1'
+export REDIS_PORT='6379'
+export REDIS_PSWD='CHANGE_HERE'
+
 export BITTREX_API_DOMAIN='https://bittrex.com/api/v1.1'
 export BITTREX_API_DOMAIN_V3='https://api.bittrex.com/v3'
 
