@@ -47,15 +47,27 @@ elif [[ $1 == 'bitmex' ]]; then
 	pre_cmd="mkdir -p $DIR/tmp && curl 'https://www.bitmex.com/api/v1/instrument/active' > $DIR/tmp/bitmex_contract.json"
 elif [[ $1 == 'kraken' ]]; then
 	spider=spider/kraken_wss.js
+elif [[ $1 == 'kraken'* ]]; then # kraken1 kraken2 ...
+	spider=spider/kraken_wss.js
 elif [[ $1 == 'hbdm' ]]; then
 	spider=spider/hbdm_wss.js
 	pre_cmd="mkdir -p $DIR/tmp && curl 'https://api.hbdm.com/api/v1/contract_contract_info' > $DIR/tmp/hbdm_contract.json"
 elif [[ $1 == 'bybit' ]]; then
+	export uranus_spider_exchange=Bybit
 	spider=spider/bybit_wss.js
+elif [[ $1 == 'bybitu' ]]; then
+	export uranus_spider_exchange=BybitU
+	spider=spider/bybit_wss.js
+elif [[ $1 == 'bybits' ]]; then
+	spider=spider/bybitspot_v2_wss.js
 elif [[ $1 == 'gemini' ]]; then
-	spider=spider/gemini_wss.js
+	spider=spider/gemini_wss_v2.js
 elif [[ $1 == 'coinbase' ]]; then
 	spider=spider/coinbase_wss.js
+elif [[ $1 == 'ftx' ]]; then
+	spider=spider/ftx_wss.js
+elif [[ $1 == 'ftx'* ]]; then # ftx1 ftx2 ...
+	spider=spider/ftx_wss.js
 elif [[ $1 == 'x' ]]; then
 	spider=spider/x.js
 elif [[ $1 == 'kill' ]]; then
@@ -63,6 +75,11 @@ elif [[ $1 == 'kill' ]]; then
 	ps aux | grep node\.*spider\/ | grep -v grep
 	echo "Press enter to kill above processes"
 	read confirm
+	ps aux | grep node\.*spider\/ | grep -v grep | awk '{ print $2 }' | xargs kill
+	release_pslock
+	exit 0
+elif [[ $1 == 'killallspidersfullauto' ]]; then # Use a long name to avoid manually call
+	acquire_pslock
 	ps aux | grep node\.*spider\/ | grep -v grep | awk '{ print $2 }' | xargs kill
 	release_pslock
 	exit 0
@@ -82,7 +99,16 @@ if [ -z $2 ] ; then
 	line=$( echo $line | awk -F '"' '{ print $2 }' | awk '{$1="";$2="";print }' | xargs )
 	echo -e "Target args:\n$line"
 	node_args=$line
+	# For auto task in tmux_uranus.sh,
+	# set URANUS_SPIDER_ODBK_MAX for less CPU usage
+	if [[ $1 == 'bybit'* || $1 == 'bncm'* || $1 == 'bnum'* ]]; then
+		export URANUS_SPIDER_ODBK_MAX=3 # Fewer memory for futures markets
+	else
+		export URANUS_SPIDER_ODBK_MAX=9
+	fi
 else
+	# For mannual pairs mode, set URANUS_SPIDER_ODBK_MAX for better view
+	export URANUS_SPIDER_ODBK_MAX=14
 	shift
 	node_args=$@
 fi
@@ -105,6 +131,8 @@ function loop_work {
 					unset $var
 				elif [[ $var == *_ADDR_* ]]; then
 					unset $var
+				elif [[ $var == URANUS_SPIDER_ODBK_MAX ]]; then
+					continue # Keep this
 				elif [[ $var == URANUS_* ]]; then
 					unset $var
 				fi

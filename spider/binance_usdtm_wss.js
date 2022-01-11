@@ -100,7 +100,8 @@ for(var p in pairsMap) {
 	orderbookAsks[pairsMap[p]] = [];
 	marketHistory[pairsMap[p]] = [];
 }
-var maxMemory = 99;
+var maxMemory = process.env['URANUS_SPIDER_ODBK_MAX'] || 99;
+maxMemory = parseInt(maxMemory);
 var debug = false;
 
 //////////////////////////////////////////////////////
@@ -123,7 +124,8 @@ function handleDepthData(market, data) {
 
 	var result = cgui.markUpdate(market, {
 		'orderbookBids'	:	orderbookBids[market],
-		'orderbookAsks'	:	orderbookAsks[market]
+		'orderbookAsks'	:	orderbookAsks[market],
+		'marketTime' : new Date() / 1 - 3600_000 // From rest snapshot, mark as old data.
 	});
 
 	// Trim data.
@@ -132,6 +134,38 @@ function handleDepthData(market, data) {
 }
 
 function handleDepthUpdateData(market, data) {
+	var ts = data.E;
+	if (orderbookBids[market] == null || orderbookAsks[market] == null)
+		return;
+	lastValidDepthMsgTime = Date.now();
+	var bids = orderbookBids[market];
+	var asks = orderbookAsks[market];
+	var bidsUpdate = data['b'];
+	var asksUpdate = data['a'];
+	for (var i in bidsUpdate) {
+		var p = parseFloat(bidsUpdate[i][0]);
+		var s = parseFloat(bidsUpdate[i][1]);
+		util.binaryUpdateBids(bids, p, s);
+	}
+	for (var i in asksUpdate) {
+		var p = parseFloat(asksUpdate[i][0]);
+		var s = parseFloat(asksUpdate[i][1]);
+		util.binaryUpdateAsks(asks, p, s);
+	}
+	var result = cgui.markUpdate(market, {
+		'orderbookBids'	:	bids,
+		'orderbookAsks'	:	asks,
+		'marketTime' : ts,
+		'skip_sorting' : true,
+		maxDepth: maxMemory
+	});
+
+	// Trim data.
+	orderbookBids[market] = bids.slice(0, maxMemory);
+	orderbookAsks[market] = asks.slice(0, maxMemory);
+}
+
+function handleDepthUpdateDataSlow(market, data) {
 	var ts = data.E;
 	if (orderbookBids[market] == null || orderbookAsks[market] == null)
 		return;
@@ -202,7 +236,6 @@ function handleTradeData(market, data) {
 			exchange,
 			fills
 		);
-	fills = fills.slice(0, maxMemory);
 	var result = cgui.markUpdate(market, {
 		'fills'		 	:	fills
 	});
@@ -216,11 +249,11 @@ function requestDepth(symbol, callback) {
 	var market = pairsMap[symbol];
 	var options = {
 		protocol:'https:',
-		hostname: 'dapi.binance.com',
-		path: '/dapi/v1/depth?limit=50&symbol='+symbol.toUpperCase(),
+		hostname: 'fapi.binance.com',
+		path: '/fapi/v1/depth?limit=50&symbol='+symbol.toUpperCase(),
 		headers: {
 			'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-			'Host': 'dapi.binance.com',
+			'Host': 'fapi.binance.com',
 			'User-Agent' : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:72.0) Gecko/20100101 Firefox/72.0'
 		},
 		timeout:10*1000,
@@ -228,7 +261,7 @@ function requestDepth(symbol, callback) {
 		interval:0
 	};
 	marketLog(market, "Requesting depth:" + JSON.stringify(options));
-	var url = 'https://dapi.binance.com/dapi/v1/depth?limit=50&symbol='+symbol.toUpperCase();
+	var url = 'https://fapi.binance.com/fapi/v1/depth?limit=50&symbol='+symbol.toUpperCase();
 	async.waterfall([
 		function(wtf_cb) {
 			// util.httpget(options, wtf_cb);

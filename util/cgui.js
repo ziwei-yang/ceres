@@ -34,7 +34,6 @@ var marketHistory = {};
 var marketStatus = {};
 var marketLogs = {};
 var maxLogs = 100;
-var maxMemory = 99;
 var ownOrders = {};
 var marketTraderStatus = {};
 var guiStarted = false;
@@ -145,7 +144,7 @@ exp.markUpdate = function(market, options) {
 			exchange,
 			market,
 			orderbookBids[market],
-			{'type':'bid'}
+			{'type':'bid', 'skip_sorting': options.skip_sorting}
 		);
 		odbkUpdated = true
 	}
@@ -155,7 +154,7 @@ exp.markUpdate = function(market, options) {
 			exchange,
 			market,
 			orderbookAsks[market],
-			{'type':'ask'}
+			{'type':'ask', 'skip_sorting': options.skip_sorting}
 		);
 		odbkUpdated = true;
 	}
@@ -184,8 +183,10 @@ exp.markUpdate = function(market, options) {
 		result['marketHistory'] = marketHistory[market];
 		tickUpdated = true;
 	} else if (fills.length > 0) {
-		// Merge, remove duplicated tuples.
-		marketHistory[market] = marketHistory[market].concat(fills).sort(sortFilledOrder(exchange)).slice(0, maxMemory);
+		// Merge, remove duplicated tuples. Keep as much as 999 for merging.
+		// Only new trades is published in broadcastNew()
+		// Only maxTickHis snapshot is published in broadcast()
+		marketHistory[market] = marketHistory[market].concat(fills).sort(sortFilledOrder(exchange)).slice(0, 999);
 		result['marketHistory'] = marketHistory[market];
 		tickUpdated = true;
 	}
@@ -210,7 +211,7 @@ exp.markUpdate = function(market, options) {
 		'odbkUpdated': odbkUpdated,
 		'marketTime' : options.marketTime
 	};
-	var flush = (Math.random() > 0.98) // Randomly log() and flush snapshot into redis sometimes.
+	var flush = (Math.random() > 0.995) // Randomly log() and flush snapshot into redis sometimes.
 	var lastSnapshotTime = lastMarketDataFlushTime[channelPrefix];
 	if (lastSnapshotTime == null)
 		lastSnapshotTime = 0;
@@ -535,6 +536,7 @@ function splitScreenBuffer(num, subDrawFunc, option) {
 ///////////////////////////////////
 // GUI functions: draw single cell
 ///////////////////////////////////
+var MAX_ODBK_VALID_ROWS = process.env['URANUS_SPIDER_ODBK_MAX'];
 function generateScreenBuffer(market, shownName, rows, cols, infoStr, opt={}) {
 	var exName = exchange;
 	var mktName = market;
@@ -577,11 +579,14 @@ function generateScreenBuffer(market, shownName, rows, cols, infoStr, opt={}) {
 	var asks = mergedOrderbookAsks[market].slice(0, odbkDisplayRows);
 	for (validOdbkRows = 1; validOdbkRows <= odbkDisplayRows; validOdbkRows++)
 		if (bids[validOdbkRows-1]==null && asks[validOdbkRows-1]==null) break;
+	// to keep orderbook shown size always.
+	if (MAX_ODBK_VALID_ROWS != null)
+		validOdbkRows = MAX_ODBK_VALID_ROWS;
 	odbkDisplayRows = Math.min(odbkDisplayRows, validOdbkRows);
 	reservedLines += odbkDisplayRows;
 	// Occupy rows for empty trades.
 	var remainLines = rows - reservedLines;
-	var ticks = marketHistory[market].slice(0, remainLines);
+	var ticks = marketHistory[market]; // .slice(0, remainLines); Merge trades
 	var validTickNum = 0;
 	for (validTickNum = 0; validTickNum < remainLines; validTickNum ++)
 		if (ticks[validTickNum] == null) break;
@@ -602,11 +607,31 @@ function generateScreenBuffer(market, shownName, rows, cols, infoStr, opt={}) {
 	}
 
 	// Trades rows.
-	for (var i = 0; i < validTickNum; i++) {
-//		stringBuffer +=(pad(i+'', 3) + "");
-		stringBuffer +=(stringifyOrder(exchange, ticks[i], 'FIL'));
-		stringBuffer +=("\n");
+	var mergedTradeNum = 0;
+	var tradesShown = 0;
+	var mergeTrade = true;
+	var tradesStringBuffer = "";
+	for (var i = 0; i < validTickNum+mergedTradeNum; i++) {
+		if (ticks[i] == null) break;
+		var mergedTick = { 's': parseFloat(ticks[i].s), 'p': ticks[i].p, 'T': ticks[i].T, 't': ticks[i].t };
+		// show merged trades at same price.
+		if (mergeTrade) {
+			for (var j = i+1; j < validTickNum+mergedTradeNum; j++) {
+				if (ticks[j] == null) break;
+				if (ticks[i].p == ticks[j].p && ticks[i].T == ticks[j].T) {
+					mergedTick.s += parseFloat(ticks[j].s);
+					i = j;
+					mergedTradeNum += 1;
+				} else break;
+			}
+		}
+		tradesStringBuffer +=(stringifyOrder(exchange, mergedTick, 'FIL'));
+		tradesStringBuffer +=("\n");
+		tradesShown += 1;
 	}
+	for (var i = 0; i < validTickNum - tradesShown; i++)
+		stringBuffer +=("\n");
+	stringBuffer += tradesStringBuffer;
 
 	// Logs.
 	var logs = marketLogs[market];

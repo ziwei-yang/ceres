@@ -92,6 +92,21 @@ module URN
 			end
 		end
 
+		def common_prefix(pairs)
+			common_prefix_len = 0
+			loop {
+				break if pairs.select { |p| p.size < common_prefix_len }.size > 0
+				if pairs.map { |p| p[0..(common_prefix_len)] }.uniq.size == 1
+					common_prefix_len += 1
+				else
+					break
+				end
+			}
+			pair_prefix = nil
+			pair_prefix = pairs[0][0..(common_prefix_len-1)] if common_prefix_len > 0
+			pair_prefix
+		end
+
 		# Keep sleeping even always waked up by other threads.
 		def keep_sleep(seconds)
 			until_t = Time.now.to_f + seconds
@@ -121,13 +136,32 @@ module URN
 			[n, sum, mean, deviation]
 		end
 
+    def rough_num(f)
+			f ||= 0
+			if f.abs > 100
+        return f.round
+			elsif f.abs > 1
+        return f.round(2)
+			elsif f.abs > 0.01
+        return f.round(4)
+			elsif f.abs > 0.0001
+        return f.round(6)
+			elsif f.abs > 0.000001
+        return f.round(8)
+      else
+        f
+      end
+    end
+
 		def format_num(f, float=8, decimal=8)
 			return ''.ljust(decimal+float+1) if f.nil?
 			return ' '.ljust(decimal+float+1, ' ') if f == 0
+			return f.round.to_s.rjust(decimal+float+1, ' ') if float == 0
 			return f.rjust(decimal+float+1) if f.is_a? String
 			num = f.to_f
 			f = "%.#{float}f" % f
 			loop do
+        break unless f.include?('.')
 				break unless f.end_with?('0')
 				break if f.end_with?('.0')
 				f = f[0..-2]
@@ -183,13 +217,22 @@ module URN
 			begin
 				a = [
 					"#{t['market']}#{t['account']}"[0..6].ljust(7),
-			 		(t['T']||'-').ljust(4),
+					(t['T']||'?').ljust(4)[0].upcase,
 					format_num(t['p'], 10, 3),
 					format_num(t['executed'], 3, 5) + '/' + format_num(t['s'], 3, 5),
 					(t['status']||'-')[0..8].ljust(9), # canceling
 					(t['i']||'-').to_s.ljust(6)[-6..-1].ljust(5),
 					format_trade_time(t['t'])
 				]
+				if t['maker_size'] != nil && t['s'] != nil
+					if t['maker_size'].to_f == t['s'].to_f
+						a.push('  ')
+					else
+						a.push('Tk'.on_white)
+					end
+				else
+					a.push('??')
+				end
 				if t['v'] != nil
 					# Print size for volume based order.
 					a[3] = format_num(t['executed_v'], 1, 7) + '/' + format_num(t['v'], 1, 7)
@@ -293,14 +336,27 @@ module URN
 		# For non-volume based order, round its key values.
 		# Then generate status cache.
 		def order_status_evaluate(o)
+			# At least add a new key, to avoid error:
+			# 	can't add a new key into hash during iteration
+			# When set new p_real while background thread is dumping json.
+			o['p_real'] = nil if o['p_real'].nil?
 			if o['v'].nil?
 				# 3.3966055045870003
 				# 0.00033031000000960375 => round(13)
 				# 764.0000000000001 => round(12)
 				# 741.000000000001 => round(11)
 				# 764.00000000001 => round(10)
-				['s', 'executed', 'remained', 'p', 'maker_size'].
-					each { |k| o[k] = o[k].round(10) }
+				if o['status'] == 'pending'
+					# Pending order might have no maker_size
+					['s', 'executed', 'remained', 'p'].
+						each { |k| o[k] = o[k].round(10) }
+					if o['maker_size'] != nil
+						o['maker_size'] = o['maker_size'].round(10)
+					end
+				else
+					['s', 'executed', 'remained', 'p', 'maker_size'].
+						each { |k| o[k] = o[k].round(10) }
+				end
 			end
 			o['_alive'] = nil
 			o['_cancelled'] = nil
@@ -397,8 +453,8 @@ module URN
 			maker_size = o['maker_size'] || 0
 			taker_size = o['executed'] - maker_size
 			type = o['T']
-			maker_fee = o['_data']['fee']["maker/#{type}"] || raise(JSON.pretty_generate(o))
-			taker_fee = o['_data']['fee']["taker/#{type}"] || raise(JSON.pretty_generate(o))
+			maker_fee = o.dig('_data','fee',"maker/#{type}") || raise(JSON.pretty_generate(o))
+			taker_fee = o.dig('_data','fee',"taker/#{type}") || raise(JSON.pretty_generate(o))
 			fee = o['p'] * maker_size * maker_fee + o['p'] * taker_size * taker_fee
 			vol = o['p'] * o['executed']
 			if type == 'buy'
@@ -447,34 +503,7 @@ module URN
 	end
 
 	module CLI
-		def terminal_width
-			# IO.console.winsize
-			# io-console does not support JRuby
-			GLI::Terminal.new.size[0]
-		end
-		def terminal_height
-			GLI::Terminal.new.size[1]
-		end
-
-		def get_input(opt={})
-			puts(opt[:prompt].white.on_black, level:2) unless opt[:prompt].nil?
-			timeout = opt[:timeout]
-			if timeout.nil?
-				return STDIN.gets.chomp
-			elsif timeout == 0
-				return 'Y'
-			else
-				ret = nil
-				begin
-					Timeout::timeout(timeout) do
-						ret = STDIN.gets.chomp
-					end
-				rescue Timeout::Error
-					ret = nil
-				end
-				return ret
-			end
-		end
+		include APD::CLI
 	end
 
 	module EmailUtil
@@ -484,7 +513,7 @@ module URN
 				last_sent_t = @sent_emails["#{receiver}/#{subject}"]
 				now = DateTime.now
 				if last_sent_t != nil && (now - last_sent_t) < 1.0/24.0
-					APD::Logger.highlight "Last t #{last_sent_t} skip sending same email:\n#{subject}\n#{content}"
+					APD::Logger.highlight "Last t #{last_sent_t} skip sending same email:\n#{subject}\n#{(content || '')[0..99]}"
 					return
 				end
 				@sent_emails["#{receiver}/#{subject}"] = now
@@ -509,15 +538,80 @@ module URN
 	# Fetch trader status from redis and conf files.
 	module TraderStatusUtil
 		include URN::OrderUtil
+		include URN::Misc
 		def redis
 			URN::RedisPool
+		end
+
+		def latest_bulk_trader_orders(pair, from_ms)
+			files = Dir["#{URN::ROOT}/bulk/*#{pair}*.json"]
+			puts "#{files.size} files got for #{pair} bulk trader"
+			files = files.select { |f| File.mtime(f).to_f * 1000 > from_ms }
+			puts "#{files.size} files filtered for #{pair} bulk trader"
+			return files.map { |f|
+				puts "Loading #{File.basename(f)} orders"
+				status = parse_json(File.read(f))
+				next [] if status['orders'].nil?
+				next [] if status['orders'].empty?
+				(status['orders'] || {}).values.reduce(:+).select { |o|
+					o['t'] >= from_ms || order_alive?(o)
+				}
+			}.reduce(:+) || []
+		end
+
+		def latest_swap_trader_orders(pair, from_ms)
+			files = Dir["#{URN::ROOT}/swap/*#{pair}*.json"].to_a
+			# USDT-STORJ orders might also in USD-STORJ@P swap tasks
+			if pair =~ /^USDT-/
+				files += Dir["#{URN::ROOT}/swap/*#{pair.gsub('USDT', 'USD')}*.json"].to_a
+			elsif pair =~ /^USD-/
+				files += Dir["#{URN::ROOT}/swap/*#{pair.gsub('USD', 'USDT')}*.json"].to_a
+			end
+			puts "#{files.size} files got for #{pair} swap trader"
+			files = files.select { |f| File.mtime(f).to_f * 1000 > from_ms }
+			puts "#{files.size} files filtered for #{pair} swap trader"
+			return files.map { |f|
+				puts "Loading #{File.basename(f)} orders"
+				status = parse_json(File.read(f))
+				maker_orders = (status['orders'] || {}).values.reduce(:+)
+				maker_orders = (maker_orders || []).select { |o|
+					o['t'] >= from_ms || order_alive?(o)
+				}
+				legacy_orders = []
+				if status.dig('task', 'legacy_info') != nil
+					legacy_orders = status['task']['legacy_info'].values.reduce(:+)
+					legacy_orders = (legacy_orders || []).select { |o|
+						o['t'] >= from_ms || order_alive?(o)
+					}
+				end
+				maker_orders + legacy_orders
+			}.reduce(:+) || []
+		end
+
+		def all_swap_hedge_files()
+			[
+				Dir["#{URN::ROOT}/swap/hedge_*.json"],
+				Dir["#{URN::ROOT}/swap/open_*.json"],
+				Dir["#{URN::ROOT}/swap/reduce_*.json"],
+				Dir["#{URN::ROOT}/swap/close_*.json"]
+			].map { |l| l.to_a }.reduce(:+)
+		end
+
+		def all_swap_files()
+			[
+				Dir["#{URN::ROOT}/swap/swap_*.json"],
+				Dir["#{URN::ROOT}/swap/hedge_*.json"],
+				Dir["#{URN::ROOT}/swap/open_*.json"],
+				Dir["#{URN::ROOT}/swap/reduce_*.json"],
+				Dir["#{URN::ROOT}/swap/close_*.json"]
+			].map { |l| l.to_a }.reduce(:+)
 		end
 
 		def trader_status(pair)
 			pair = pair.upcase
 			keys = redis.keys "URANUS:orders:#{pair}*"
 			if keys.empty?
-				puts "No redis keys forURANUS:orders:#{pair}*".red
+				puts "No redis keys for URANUS:orders:#{pair}*".red
 				return {}
 			end
 			raise "More than one key for pair #{pair}: #{keys}" unless keys.size == 1
@@ -530,11 +624,50 @@ module URN
 			data = JSON.parse data
 		end
 
+		def trader_full_state_on_disk(pair, opt={})
+			verbose = opt[:verbose] == true
+			content = nil
+			dir=nil
+			file=nil
+
+			if pair =~ /^[0-9A-Za-z\-]{1,12}$/
+				if ENV['URANUS_RAMDISK'] != nil
+					dir = "#{ENV['URANUS_RAMDISK']}/trader_state/"
+					file = Dir["#{dir}/*"].
+						select { |f| f.upcase.include?(pair.upcase) }.first
+				end
+				if file.nil?
+					dir = "./trader_state/"
+					file = Dir["#{dir}/*"].
+						select { |f| f.upcase.include?(pair.upcase) }.first
+				end
+				puts pair if verbose
+				puts dir if verbose
+				puts file if verbose
+				raise "No match file #{file} #{pair}" if file.nil?
+			end
+
+			if file.end_with?('.lz4')
+				content = LZ4::decompress(File.read(file))
+			elsif file.end_with?('.gz')
+				Zlib::GzipReader.open(file) { |gz| content = gz.read }
+			elsif file.end_with?('.json')
+				content = File.read(file)
+			elsif file.include?('.gz.') # history state
+				Zlib::GzipReader.open(file) { |gz| content = gz.read }
+			else
+				content = File.read(file)
+			end
+			return Oj.load(content)
+		end
+
 		# Return pair list in /task/arbitrage_*
 		def available_trading_pairs()
-			pairs = Dir["#{URN::ROOT}/task/arbitrage_*.sh"].map do |f|
-				File.basename(f).split('arbitrage_')[1].split('.sh')[0].upcase
-			end
+			pairs = Dir["#{URN::ROOT}/task/arbitrage_*.sh"].map { |f|
+				p = File.basename(f).split('arbitrage_')[1].split('.sh')[0].upcase.gsub('_', '-')
+				p = "BTC-#{p}" unless p.include?('-')
+				p
+			}
 		end
 
 		def active_task_exchanges
@@ -570,16 +703,27 @@ module URN
 				map { |m| m.gsub("'",'').split('@').first }
 		end
 
-		def active_spider_exchanges(pair)
-			base, asset = pair_assets(pair)
-			keyword = asset
-			keyword = "#{base}-#{asset}" if base != 'BTC'
+		def active_spider_tasks
 			file = "#{URN::ROOT}/bin/tmux_uranus.sh"
-			File.read(file).
-				split("\n").select { |l| l.include?('/spider.sh') }.
-				map { |l| l.split('spider.sh')[1].gsub('"', '').strip }.
-				select { |l| l.upcase.split(' ').include?(keyword.upcase) }.
-				map { |l| l.split(' ').first }
+			lines = File.read(file).split("\n").select { |l| l.include?('/spider.sh') }
+			result = {}
+			lines.each { |l|
+				args = l.split('spider.sh')[1].gsub('"', '').strip.upcase.split(' ')
+				market = args.shift
+				market = 'FTX' if market =~ /^FTX[0-9]*/ # FTX0-9 sub tasks -> FTX
+				pairs = args.map { |a| (a.include?('-') ? a : "BTC-#{a}") }
+				pairs.each { |p|
+					result[p] ||= {}
+					result[p][market] = true
+					# Gemini also publish usd pairs data to usdt pairs
+					if market == 'GEMINI' && p =~ /^USD-/
+						usdt_p = p.gsub('USD-', 'USDT-')
+						result[usdt_p] ||= {}
+						result[usdt_p][market] = true
+					end
+				}
+			}
+			result
 		end
 	end
 
@@ -625,7 +769,8 @@ module URN
 				name = r['symbol'] || raise("No symbol in #{r}")
 				name = name.upcase
 				full_name = r['name'] || raise("No name in #{r}")
-				price = r['current_price'] || raise("No current_price in #{r}")
+				price = r['current_price'] # || raise("No current_price in #{r}")
+				next if price.nil?
 				rank = r['market_cap_rank'] || 99999
 				percent_change_24h = r['price_change_percentage_24h'] || 0
 				market_cap = r['market_cap'] || raise("No market_cap in #{r}")
@@ -813,7 +958,7 @@ unless defined? URN::BOOTSTRAP_LOAD_STARTED
 		# puts "loading #{f}"
 		require_relative "./#{File.basename(f)}"
 	end
-	URN::ROOT = File.dirname(__FILE__) + '/../'
+	URN::ROOT = File.expand_path(File.dirname(__FILE__) + '/../')
 	URN::API_PROXY = (ENV['API_PROXY'] || 'default').
 		split(',').
 		map { |str| str=='default'?nil:str }

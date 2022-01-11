@@ -3,10 +3,6 @@ export OS=$( uname )
 
 export URANUS_ENV_VER='20200219'
 
-export REDIS_HOST='127.0.0.1'
-export REDIS_PORT='6379'
-export REDIS_PSWD='CHANGE_HERE'
-
 export BITTREX_API_DOMAIN='https://bittrex.com/api/v1.1'
 export BITTREX_API_DOMAIN_V3='https://api.bittrex.com/v3'
 
@@ -18,15 +14,18 @@ export BFX_API_DOMAIN='https://api.bitfinex.com'
 
 export BINANCE_API_DOMAIN_V3='https://api.binance.com'
 export BINANCE_API_DOMAIN_CM='https://dapi.binance.com'
+export BINANCE_API_DOMAIN_UM='https://fapi.binance.com'
 
 export HUOBI_API_DOMAIN_TRADE='https://api.huobi.pro'
 export HUOBI_API_DOMAIN_MARKET='https://api.huobi.pro'
 
 export HBDM_API_DOMAIN='https://api.hbdm.com'
 
+export FTX_API_DOMAIN='https://ftx.com'
+
 export OKEX_API_DOMAIN='https://www.okex.com/api'
 
-export URANUS_WITHDRAW_MARKETS='BINANCE,BITTREX,HITBTC,HUOBI,BFX,OKEX,POLO,KRAKEN'
+export URANUS_WITHDRAW_MARKETS='COINBASE,BINANCE,BITTREX,HITBTC,HUOBI,BFX,OKEX,POLO,KRAKEN,FTX'
 export URANUS_DEPOSIT_MARKETS="$URANUS_WITHDRAW_MARKETS",BITMEX
 
 export ZB_API_DOMAIN_MATKET='https://api.zb.com/data'
@@ -45,9 +44,13 @@ export BYBIT_API_DOMAIN='https://api.bybit.com'
 
 export GEMINI_API_DOMAIN='https://api.gemini.com'
 
-export TWS_GATEWAY_NAME=zwyang
+export COINBASE_PRO_API_DOMAIN='https://api.pro.coinbase.com'
+export COINBASE_API_DOMAIN='https://api.coinbase.com'
 
-export RUBY_VER='2.7.2'
+export TWS_GATEWAY_NAME=zwyang
+export IB_ACCOUNT=U8620103
+
+export RUBY_VER='3.0.0'
 # export RUBY_VER='jruby'
 # Tuning JRuby
 # https://github.com/jruby/jruby/wiki/PerformanceTuning
@@ -55,12 +58,13 @@ jruby_profile_arg='-J-Dcom.sun.management.jmxremote -J-Dcom.sun.management.jmxre
 [[ $RUBY_VER == jruby* ]] && \
 	export JRUBY_OPTS="-J-server -J-Xmx1024m -J-Xms1024m $jruby_profile_arg" && \
 	export RUBYOPT=''
+
 # Setup Ruby JIT options from 2.6
 # http://engineering.appfolio.com/appfolio-engineering/2018/4/3/ruby-26-and-ahead-of-time-compilation
-[[ $RUBY_VER == 2.* ]] && \
-	export JRUBY_OPTS='' && \
-	export RUBYOPT='--jit --jit-min-calls=99999 --jit-max-cache=99999' && \
-	export RUBYOPT=''
+# [[ $RUBY_VER == 2.* ]] && \
+# 	export JRUBY_OPTS='' && \
+# 	export RUBYOPT='--jit --jit-min-calls=99999 --jit-max-cache=99999' && \
+# 	export RUBYOPT=''
 
 export NODE_VER='12'
 
@@ -142,7 +146,7 @@ if [[ $@ == *KEY* && -z $OKEX_ADDR_ZEN ]]; then
 			sudo killall -9 gpg-agent 2>/dev/null
 		fi
 		# Change bash PS1 to alert user.
-		[[ ! -z $OKEX_ADDR_ZEN ]] && export PS1="\033[07mURN KEY $PS1\033[0m"
+		[[ ! -z $OKEX_ADDR_ZEN ]] && export PS1="[! URN KEY !] $PS1"
 	else
 		echo "No key conf at $gpg_f press enter to exit"
 		read
@@ -162,7 +166,9 @@ export URANUS_LOG_ARCHIVE_DIR="$__DIR__/log/archive"
 export URANUS_LOG_DIR="$__DIR__/log"
 if [[ $OS == 'Darwin' ]]; then
 	# Only use external directory when disk is still there.
-	export URANUS_DARWIN_EXT_DIR='/Volumes/320GB/uranus'
+	# Use 250GB first, if missing then 320GB
+	export URANUS_DARWIN_EXT_DIR='/Volumes/250GB/uranus'
+	[ ! -d $URANUS_DARWIN_EXT_DIR ] && export URANUS_DARWIN_EXT_DIR='/Volumes/320GB/uranus'
 	if [ -d $URANUS_DARWIN_EXT_DIR ] ; then
 		export URANUS_LOG_ARCHIVE_DIR="$URANUS_DARWIN_EXT_DIR/log_archive"
 		export URANUS_LOG_DIR="$URANUS_DARWIN_EXT_DIR/log"
@@ -172,6 +178,26 @@ if [[ $OS == 'Darwin' ]]; then
 	fi
 fi
 mkdir -p "$URANUS_LOG_ARCHIVE_DIR"
+
+export URANUS_RAMDISK=
+if [[ $OS == 'Linux' ]]; then
+	ram_disk=$( df -h | grep RAMDisk | wc -l )
+	if [[ $ram_disk -gt 0 ]]; then
+		df -h | grep RAMDisk
+		ramdisk=$( df -h | grep RAMDisk | awk '{ print $6 }' )
+		echo "Ramdisk exist at $ramdisk"
+	fi
+	export URANUS_RAMDISK=$ramdisk
+elif [[ $OS == 'Darwin' ]]; then
+	ram_disk=$( df -h | grep RAMDisk | wc -l )
+	if [[ $ram_disk -gt 0 ]]; then
+		df -h | grep RAMDisk
+		ramdisk=$( df -h | grep RAMDisk | awk '{ print $9 }' )
+		echo "Ramdisk exist at $ramdisk"
+	fi
+	export URANUS_RAMDISK=$ramdisk
+fi
+
 function uranus_archive_old_logs {
 	for log in $1*.log ; do
 		[ ! -f $log ] && continue
@@ -195,17 +221,33 @@ function uranus_archive_old_logs {
 			fi
 		done
 		ls -ahl  "$log"
-		echo " > $URANUS_LOG_ARCHIVE_DIR/$gzname"
-		cat "$log" | gzip --best > "$URANUS_LOG_ARCHIVE_DIR"/"$gzname"
-		if [[ $? == 0 ]] ; then
-			rm $log
-		else
-			echo "Failed, press enter to continue"
-			read
+		ramdisk_avail=0
+		[ ! -z $URANUS_RAMDISK ] && ramdisk_avail=$( df | grep RAMDisk | awk '{ print $4 }' )
+		if [ $ramdisk_avail -lt 300000 ]; then # If ramdisk available less than 300MB
+			echo " > $URANUS_LOG_ARCHIVE_DIR/$gzname"
+			cat "$log" | gzip --best > "$URANUS_LOG_ARCHIVE_DIR"/"$gzname"
+			if [[ $? == 0 ]] ; then
+				rm $log
+				continue
+			fi
+		else # Compress to ramdisk then move to archive place.
+			echo " > $URANUS_RAMDISK/$gzname"
+			cat "$log" | gzip --best > "$URANUS_RAMDISK"/"$gzname"
+			if [[ $? == 0 ]] ; then
+				echo mv "$URANUS_RAMDISK"/"$gzname" "$URANUS_LOG_ARCHIVE_DIR"/"$gzname"
+				mv "$URANUS_RAMDISK"/"$gzname" "$URANUS_LOG_ARCHIVE_DIR"/"$gzname"
+				if [[ $? == 0 ]] ; then
+					rm $log
+					continue
+				fi
+			fi
 		fi
+		echo "Failed, press enter to continue"
+		read
 	done
 }
 export HOSTNAME # For sending email
 
 # Do dynamic API filtering for Bitstamp in env2
 [ -f  $__DIR__/conf/env2.sh ] && source $__DIR__/conf/env2.sh
+[ -d  $__DIR__/tmp ] || mkdir $__DIR__/tmp

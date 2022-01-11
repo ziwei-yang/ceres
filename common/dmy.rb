@@ -1,4 +1,5 @@
 require_relative '../common/bootstrap' unless defined? URN::BOOTSTRAP_LOAD
+require_relative '../common/mgr' unless defined? URN::BOOTSTRAP_LOAD
 
 # This includes dummy modules that provide same functions as in common/mkt.rb
 # But all operations are fake and could be emulated based on market historical data.
@@ -215,7 +216,7 @@ module URN
 		end
 	end
 
-	class DummyAssetManager < URN::StandardMarketManager
+	class DummyAssetManager < URN::AsyncMarketManager
 		def initialize(opt={})
 			@debug = opt[:debug] == true
 			@verbose = opt[:verbose] == true

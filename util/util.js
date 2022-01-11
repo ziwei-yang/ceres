@@ -104,7 +104,9 @@ exp.getCliPairs = function() {
 			pairs.push(args[i].toUpperCase());
 		else
 			pairs.push(base + '-' + args[i].toUpperCase());
-	return pairs;
+	var uniqPairMap = {}; // Uniq pairs.
+	pairs.forEach((p) => { uniqPairMap[p] = 1; });
+	return Object.keys(uniqPairMap);
 }
 
 // From highest price to lowest price.
@@ -151,20 +153,22 @@ exp.sortAndMergeOrderbook = function (exchange, market, orderbook, option) {
 	var omitOrderbookSize = option['omitOrderbookSize'];
 	if (omitOrderbookSize == null) {
 		if (market.indexOf('BTC-') == 0)
-			omitOrderbookSize = 0.0001;
+			omitOrderbookSize = 0.00005;
 		else if (market.indexOf('USD-') == 0)
-			omitOrderbookSize = 10;
+			omitOrderbookSize = 5;
 		else if (market.indexOf('USDT-') == 0)
-			omitOrderbookSize = 10;
+			omitOrderbookSize = 5;
 		else if (market.indexOf('ETH-') == 0)
-			omitOrderbookSize = 0.001;
+			omitOrderbookSize = 0.0002;
 		else if (market.indexOf('EUR-') == 0)
 			omitOrderbookSize = 10;
 		else
 			omitOrderbookSize = 0;
 	}
 	var newOrderBook = null;
-	if (type == 'bid') {
+	if (option.skip_sorting == true) {
+		newOrderBook = orderbook; // Skip sorting.
+	} if (type == 'bid') {
 		newOrderBook = orderbook.sort(sortBuyOrder(exchange));
 	} else if (type == 'ask') {
 		newOrderBook = orderbook.sort(sortSellOrder(exchange));
@@ -174,8 +178,98 @@ exp.sortAndMergeOrderbook = function (exchange, market, orderbook, option) {
 		return newOrderBook;
 
 	// Filter orderbook by omitOrderbookSize.
-	var odbk = newOrderBook.filter((o) => parseSize(exchange, o)*parsePrice(exchange, o) > omitOrderbookSize);
+	var odbk = newOrderBook.filter((o) => parseSize(exchange, o)*parsePrice(exchange, o) >= omitOrderbookSize);
 	return odbk;
+}
+
+exp.binaryUpdateAsks = function(asks, p, s, maxLen=null) {
+	var pos = exp.binarySearchInAsks(asks, p);
+	var len = asks.length;
+	if (pos == len) {
+		if (s > 0 && (maxLen == null || len < maxLen))
+			asks.push({ 'p':p, 's':s });
+	} else if (asks[pos].p == p) {
+		if (s > 0) asks[pos].s = s;
+		else asks.splice(pos, 1);
+	} else { // Insert only if need
+		if (s > 0) asks.splice(pos, 0, { 'p':p, 's':s });
+	}
+	return asks;
+}
+exp.binaryUpdateBids = function(bids, p, s, maxLen=null) {
+	var pos = exp.binarySearchInBids(bids, p);
+	var len = bids.length;
+	if (pos == len) {
+		if (s > 0 && (maxLen == null || len < maxLen))
+			bids.push({ 'p':p, 's':s });
+	} else if (bids[pos].p == p) {
+		if (s > 0) bids[pos].s = s;
+		else bids.splice(pos, 1);
+	} else { // Insert only if need
+		if (s > 0) bids.splice(pos, 0, { 'p':p, 's':s });
+	}
+	return bids;
+}
+// Search price index in sorted asks low->high, find pos to replace or insert.
+exp.binarySearchInAsks = function(asks, price) {
+	var len = asks.length;
+	if (len == 0) return 0;
+	var fromPos = 0;
+	var endPos = len-1;
+	while(true) {
+		var r = binarySearchOdbkRange(asks, price, fromPos, endPos, true);
+		if (r[0] == true) return r[1];
+		fromPos = r[1];
+		endPos = r[2];
+	}
+}
+exp.binarySearchInBids = function(asks, price) {
+	var len = asks.length;
+	if (len == 0) return 0;
+	var fromPos = 0;
+	var endPos = len-1;
+	while(true) {
+		var r = binarySearchOdbkRange(asks, price, fromPos, endPos, false);
+		if (r[0] == true) return r[1];
+		fromPos = r[1];
+		endPos = r[2];
+	}
+}
+// return [true, pos] if hit
+// return [false, newRangeFrom, newRangeTo] if not
+function binarySearchOdbkRange(array, price, fromPos, endPos, isAsk) {
+	if (fromPos > endPos)
+		throw Error("Unexpected range:" + fromPos + "," + endPos);
+	else if (fromPos == endPos) {
+		if (isAsk) {
+			if (array[fromPos].p >= price) return [true, fromPos];
+			return [true, fromPos+1];
+		} else {
+			if (array[fromPos].p <= price) return [true, fromPos];
+			return [true, fromPos+1];
+		}
+	} else { // fromPos < endPos
+		var midPos = parseInt((fromPos+endPos)/2);
+		if (array[midPos].p == price)
+			return [true, midPos];
+		if (isAsk) {
+			if (array[midPos].p < price) {
+				return [false, midPos+1, endPos]; // search in new range
+			} else { // mid price > price
+				if (fromPos == midPos) // happens when fromPos+1 == endPos
+					return [true, midPos];
+				return [false, fromPos, midPos-1]; // search in new range
+			}
+		} else {
+			if (array[midPos].p > price) {
+				return [false, midPos+1, endPos]; // search in new range
+			} else { // mid price < price
+				if (fromPos == midPos) // happens when fromPos+1 == endPos
+					return [true, midPos];
+				return [false, fromPos, midPos-1]; // search in new range
+			}
+		}
+	}
 }
 
 exp.sortAndMergeTrades = function (exchange, fills, option) {
@@ -302,10 +396,10 @@ exp.stringifyOrder = function (exchange, order, type) {
 		else
 			return formatNum(order[key], 1, 10) + "" + formatNum(parseSize(exchange, order), 7, 3);
 	else
-		if (order[key2] > 10000)
+		if (order[key2] > 2000)
 			return formatNum(order[key], 6, 5) + "" + formatNum(parseSize(exchange, order)/1000, 8, 0, 'k') + '  ';
 		else
-			return formatNum(order[key], 6, 8) + "" + formatNum(parseSize(exchange, order), 4, 3);
+			return formatNum(order[key], 6, 8) + "" + formatNum(parseSize(exchange, order), 4, 5);
 }
 
 exp.traderStatus = function(pairNameArray, callback) {

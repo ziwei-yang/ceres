@@ -1,4 +1,4 @@
-# Base framework for single market algorithm.
+# Base framework for algorithm.
 module URN
 	# Each MarketAlgo has a core thread, which would be waken by others
 	class MarketAlgo
@@ -76,6 +76,9 @@ module URN
 			@_order_updates = Concurrent::Array.new
 			@_misc_updates = Concurrent::Array.new
 
+			# Process signal buffer
+			@commands = []
+
 			# Internal statistic
 			@_order_place_t = 0
 
@@ -130,7 +133,7 @@ module URN
 			# Force redirect all log in live mode.
 			# Logger would only allow one algo running to direct logs.
 			if @mode == :live
-				APD::Logger.global_output_file = "#{URN::ROOT}/logs/#{@name}.#{@mode}.log"
+				APD::Logger.global_output_file = "#{URN::ROOT}/log/#{@name}.#{@mode}.log"
 			end
 
 			print_info_sync() if @mode != :backtest
@@ -249,7 +252,7 @@ module URN
 		end
 
 		################################################
-		# Signal Stat
+		# Signal Stat methods: init, record, finish
 		################################################
 		def signal_stat_init(signal_names)
 			# Prepare signal stat file.
@@ -302,6 +305,21 @@ module URN
 
 		def signal_stat_finish
 			@_stat_w.close unless @_stat_w.nil?
+		end
+
+		################################################
+		# On process SIGNAL command
+		################################################
+		def on_sig_interrupt
+			signal_stat_finish()
+			save_state_sync()
+			@commands.push "SIGINT"
+		end
+
+		def on_sig_quit
+			signal_stat_finish()
+			save_state_sync()
+			@commands.push "SIGQUIT"
 		end
 
 		################################################

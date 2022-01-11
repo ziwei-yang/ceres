@@ -12,7 +12,9 @@ module URN
 
 		@@_oms_broadcast_channels ||= {}
 		@@oms_local_cache ||= Concurrent::Hash.new
+		# Receiving data for market
 		@@work_markets ||= Concurrent::Hash.new
+		# Full data snapshot is ready for market
 		@@inited_markets ||= Concurrent::Hash.new
 		@@listeners ||= Concurrent::Array.new
 		@@max_cache_size ||= Concurrent::Hash.new
@@ -27,7 +29,16 @@ module URN
 			puts *args if @@verbose != false
 		end
 
-		def self.monitor(markets, listeners=[], opt={})
+		def self.monitor(market_account_map, listeners=[], opt={})
+      if market_account_map.is_a?(Array)
+        markets = market_account_map
+        market_account_map = {}
+      else
+        markets = market_account_map.keys.uniq
+      end
+      # Rebuild map with default accounts.
+      @@oms_account = market_account_map.clone
+      markets.each { |m| @@oms_account[m] ||= '-' }
 			@@verbose = opt[:verbose] == true
 			listeners.each { |l| add_listener(l) }
 
@@ -39,34 +50,54 @@ module URN
 				end
 				@@oms_local_cache[mkt] = Concurrent::Hash.new
 				# oms.js : `URANUS:${exchange}:${account}:O_channel`;
-				@@_oms_broadcast_channels["URANUS:#{mkt}:-:O_channel"] = mkt
-				channels.push "URANUS:#{mkt}:-:O_channel"
+				@@_oms_broadcast_channels["URANUS:#{mkt}:#{@@oms_account[mkt]}:O_channel"] = mkt
+				channels.push "URANUS:#{mkt}:#{@@oms_account[mkt]}:O_channel"
 				next true
 			end
+      puts "market_account_map #{market_account_map}"
+      puts "started_markets #{started_markets}"
 			
+			listen_thread = nil
 			if started_markets.size > 0
-				t = Thread.new(abort_on_exception:true) {
+				listen_thread = Thread.new(abort_on_exception:true) {
 					Thread.current[:name] = "OMSLocalCache.listen #{started_markets}"
+          puts "OMSLocalCache.listen #{started_markets} #{JSON.pretty_generate(channels)}"
 					begin
 						_listen_oms(channels, pair_prefix: opt[:pair_prefix])
 					rescue => e
 						APD::Logger.error e
 					end
 				}
-				t.priority = 3
+				listen_thread.priority = 3
 				log "OMS cache started for #{started_markets}"
 			end
 
-			if opt[:wait] == true
+			max_wait_time = nil
+			max_wait_time = 20 if opt[:wait] == true
+			max_wait_time = opt[:wait] if opt[:wait].is_a?(Integer)
+			if max_wait_time != nil
+				start_wait_t = Time.now.to_f
 				markets.each { |m|
 					loop {
-						break if m == 'Bitstamp'
+            break if ['Bitstamp'].include?(m)
+            # IB OMS always init only when first new orders found,
+            # wait for this to place new order is not practical.
+            break if URN::IB_MARKETS.include?(m)
 						break if URN::OMSLocalCache.support_mkt?(m)
-						puts "Wait for #{m} OMS started"
-						sleep 1
+						wait_t = Time.now.to_f - start_wait_t
+						if wait_t > max_wait_time
+							puts "Wait for #{m} OMS started work:#{@@work_markets} init:#{@@inited_markets}, timeout".red
+							break
+						end
+						puts "Wait for #{m} OMS started work:#{@@work_markets} init:#{@@inited_markets}"
+						sleep 3
 					}
 				}
+			else
+				raise "Please check the code, wait is not true might make listening thread has no chance to start"
 			end
+
+			return listen_thread
 		end
 
 		def self.add_listener(l)
@@ -104,8 +135,9 @@ module URN
 
 		# For mkt oms_order_delete()
 		def self.oms_delete(mkt, id)
-			if @@work_markets[mkt] == true
-				@@oms_local_cache[mkt].delete(id)
+			cache = @@oms_local_cache[mkt]
+      if cache != nil
+				cache.delete(id)
 				log ">> delete OMSCache/#{mkt} #{id}".red
 			end
 		end
@@ -160,7 +192,7 @@ module URN
 
 		def self._init_order_cache(chn, opt={})
 			mkt = @@_oms_broadcast_channels[chn] # {id:json_str}
-			oms_running = endless_retry(sleep:1) { redis.get("URANUS:#{mkt}:-:OMS") }
+			oms_running = endless_retry(sleep:1) { redis.get("URANUS:#{mkt}:#{@@oms_account[mkt]}:OMS") }
 			if oms_running.nil?
 				log "<< OMS #{mkt} OFF, skip _init_order_cache()".red
 				return
@@ -170,7 +202,7 @@ module URN
 			# Only care about pairs with those preix:
 			# Example: prefix USD-BTC -> USD-BTC, USD-BTC@20200626
 			pair_prefix = opt[:pair_prefix] || ''
-			prefix = "URANUS:#{mkt}:-:O:#{pair_prefix}"
+			prefix = "URANUS:#{mkt}:#{@@oms_account[mkt]}:O:#{pair_prefix}"
 			hash_names = endless_retry(sleep:1) {
 				redis.keys('URANUS*').select { |n| n.start_with?(prefix) }
 			}
@@ -200,26 +232,42 @@ module URN
 
 		def self._listen_oms(channels, opt={})
 			pair_prefix = opt[:pair_prefix] || ''
+			channels.each { |chn|
+				mkt = @@_oms_broadcast_channels[chn]
+				@@work_markets[mkt] = false
+				@@inited_markets[mkt] = false
+			}
+      channels.each { |chn| _init_order_cache(chn, pair_prefix: pair_prefix) }
 			log "<< OMS cache subscribing #{channels}"
 			redis.subscribe(*channels) do |on|
 				on.subscribe do |chn, num|
 					log "<< OMS cache subscribed to #{chn} (#{num} subscriptions)"
+					mkt = @@_oms_broadcast_channels[chn]
+					@@work_markets[mkt] = true
 					# Get full snapshot of orders
-					_init_order_cache(chn, pair_prefix: pair_prefix)
+					mkt = @@_oms_broadcast_channels[chn]
+					_init_order_cache(chn, pair_prefix: pair_prefix) if @@work_markets[mkt] != true
 				end
 				on.message do |chn, msg|
 					begin
-						mkt = @@_oms_broadcast_channels[chn] # {id:json_str}
-						if msg == 'CLEAR' # Execute remote signal
-							log "<< OMS cache #{mkt} signal: CLEAR".red
-							@@work_markets[mkt] = false
-							@@inited_markets[mkt] = false
-							@@oms_local_cache[mkt].clear
+						mkt = @@_oms_broadcast_channels[chn]
+						if msg =~ /^SIGNAL/ # msg = {id:json_str} OR SIGNAL/COMMAND
+							log "<< #{msg} - Signal received"
+							if msg == 'SIGNAL/CLEAR' # Execute remote signal
+								log "<< OMS cache #{mkt} signal: CLEAR".red
+								@@work_markets[mkt] = false
+								@@inited_markets[mkt] = false
+								@@oms_local_cache[mkt].clear
+							elsif msg == 'SIGNAL/ONLINE' # Execute remote signal
+								_init_order_cache(chn, pair_prefix: pair_prefix) if @@work_markets[mkt] != true
+							else
+								log "<< #{msg} - unknown channel signal"
+							end
 							next
 						end
 
 						# Cache would be enabled again.
-						_init_order_cache(chn, pair_prefix: pair_prefix) if @@work_markets[mkt] == false
+						_init_order_cache(chn, pair_prefix: pair_prefix) if @@work_markets[mkt] != true
 
 						msg = JSON.parse(msg)
 						# log "<< OMS cache #{mkt} #{msg.keys}" if @@verbose
@@ -236,7 +284,7 @@ module URN
 
 						# Maintain @@oms_local_cache : just purge when size is too big.
 						max_size = @@max_cache_size[mkt]
-						if size >= max_size
+						if max_size != nil && size >= max_size
 							log "<< OMS cache #{mkt} size #{size} >= #{max_size} PURGE triggered".red
 							@@work_markets[mkt] = false
 							@@inited_markets[mkt] = false

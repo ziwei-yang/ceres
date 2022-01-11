@@ -20,11 +20,12 @@ module URN
 		end
 
 		def can_deposit?(asset)
-			true
+			all_pairs(allow_fail: true) if @gemini_pair_info.nil?
+			@gemini_pair_info.keys.select { |p| p.split('-').include?(asset.upcase.strip) }.size > 0
 		end
 
 		def can_withdraw?(asset)
-			true
+			can_deposit?(asset)
 		end
 
 		def withdraw_fee(asset, opt={})
@@ -118,20 +119,33 @@ module URN
 
 		def min_quantity(pair)
 			pair = get_active_pair(pair)
-			return @gemini_pair_info.dig(pair, :min_order_size) || raise("Not implement #{pair}")
+			return pair_detail(pair)[:min_order_size] || raise("Not implement #{pair}")
 		end
 
 		def quantity_step(pair)
 			pair = get_active_pair(pair)
-			return @gemini_pair_info.dig(pair, :quantity_step) || raise("Not implement #{pair}")
+			return pair_detail(pair)[:quantity_step] || raise("Not implement #{pair}")
 		end
 
 		def price_step(pair)
 			pair = get_active_pair(pair)
-			return @gemini_pair_info.dig(pair, :price_step) || raise("Not implement #{pair}")
+			return pair_detail(pair)[:price_step] || raise("Not implement #{pair}")
 		end
 
-		def _gemini_parse_rules
+		def pair_detail(pair, opt={})
+			@gemini_pair_info ||= {}
+			return @gemini_pair_info[pair] if @gemini_pair_info[pair] != nil
+			res = gemini_req "/v1/symbols/details/#{gemini_symbol(pair)}", public:true, allow_fail:true, silent:opt[:silent]
+			raise APD::ExpireResultFailed.new if res.nil? && opt[:allow_fail] == true
+			@gemini_pair_info[pair] = {
+				:min_order_size => res['min_order_size'].to_f,
+				:quantity_step => res['tick_size'].to_f,
+				:price_step => res['quote_increment'].to_f
+			}
+		end
+		expire_every MARKET_ASSET_FEE_CACHE_T, :pair_detail
+
+		def _gemini_parse_rules # Suggest using pair_detail()
 			# https://docs.gemini.com/rest-api/#symbols-and-minimums
 			# Also, could query one by one from https://docs.gemini.com/rest-api/#symbol-details
 			fpath = "#{URN::ROOT}/res/gemini_rules.txt"
@@ -139,6 +153,7 @@ module URN
 			gemini_pair_info = {}
 			File.read(fpath).split("\n").each_with_index { |line, i|
 				next if i == 0
+				next if line.size < 10
 				segs = line.split("\t").map { |s| s.strip }
 				pair = gemini_standard_pair(segs[0])
 					gemini_pair_info[pair] = {
@@ -159,19 +174,22 @@ module URN
 				'taker/buy' => 0.35/100,
 				'taker/sell' =>0.35/100 
 			}
+			first_time = @_fee_rate_real.nil?
 			@_fee_rate_real ||= {}
-			res = gemini_req '/v1/notionalvolume', allow_fail:true, silent:opt[:silent]
+			res = redis_cached_call('notional_volume', 3600) {
+				gemini_req '/v1/notionalvolume', allow_fail:true, silent:opt[:silent]
+			}
 			if res.nil?
 				if opt[:allow_fail] == true
 					raise APD::ExpireResultFailed.new
 				else
 					# If allow_fail is false, force using max fee if failed, don't block main process.
-					puts "Fallback to highest fee rate."
+					puts "Fallback to highest fee rate: #{pair}"
 					@_fee_rate_real[pair] = highest_fee_map
 					return @_fee_rate_real[pair]
 				end
 			end
-			puts res
+			puts res if first_time
 
 			# Fee info is contained in JSON
 			raise "No api_maker_fee_bps" if res['api_maker_fee_bps'].nil?
@@ -194,9 +212,10 @@ module URN
 		end
 		
 		def initialize(opt={})
-			@GEMINI_API_DOMAIN = ENV['GEMINI_API_DOMAIN'] || abort('GEMINI_API_DOMAIN is not set in ENV')
-			@GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || abort('GEMINI_API_KEY is not set in ENV')
-			@GEMINI_API_SEC = ENV['GEMINI_API_SEC'] || abort('GEMINI_API_SEC is not set in ENV')
+			@could_be_banned = true
+			@GEMINI_API_DOMAIN = ENV['GEMINI_API_DOMAIN'] || raise('GEMINI_API_DOMAIN is not set in ENV')
+			@GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || raise('GEMINI_API_KEY is not set in ENV')
+			@GEMINI_API_SEC = ENV['GEMINI_API_SEC'] || raise('GEMINI_API_SEC is not set in ENV')
 			@http_proxy_str = @GEMINI_API_PROXY = (ENV['GEMINI_API_PROXY'] || 'default').
 				split(',').
 				map { |str| str=='default'?nil:str }
@@ -205,7 +224,7 @@ module URN
 		end
 
 		def _gemini_account_list(opt={})
-			res = gemini_req '/v1/account/list', allow_fail: opt[:allow_fail]
+			res = gemini_req '/v1/account/list', opt
 			return nil if res.nil? && opt[:allow_fail] == true
 			# puts JSON.pretty_generate(res) if @verbose
 			res
@@ -216,8 +235,10 @@ module URN
 			account_list = _gemini_account_list(opt)
 			return nil if account_list.nil? && opt[:allow_fail] == true
 			raise "Must have a primary account" if account_list.select { |a| a['account'] == 'primary' }.empty?
+			# puts JSON.pretty_generate(account_list)
 
-			res = gemini_req '/v1/balances', allow_fail: opt[:allow_fail]
+			res = gemini_req '/v1/balances', opt
+			return nil if res.nil? && opt[:allow_fail] == true
 			# puts JSON.pretty_generate(res) if @verbose
 			cache = res.map { |r|
 				asset = r['currency'].upcase
@@ -228,6 +249,10 @@ module URN
 						'reserved'=>ttl-available
 				}]
 			}.to_h
+			cache = cache.to_a.select do |kv|
+				r = kv[1]
+				r['cash'] > 0 || r['reserved'] > 0
+			end.to_h
 			balance_cache_write cache
 			balance_cache_print if verbose
 			@balance_cache
@@ -272,9 +297,9 @@ module URN
 				}
 				return nil if json.nil? && opt[:allow_fail] == true
 				raise OrderMightBePlaced.new if opt[:test_order_might_be_place] == true
-			rescue OrderAlreadyPlaced, OrderMightBePlaced => e
+			rescue OrderMightBePlaced => e
 				cost_s = (Time.now.to_f - place_time_i/1000 - 2)
-				sleep_s = [60 - cost_s, 5].max
+				sleep_s = [150 - cost_s, 5].max # 19:28:43 placed -> 19:30:42 appearred
 				puts "Order might be placed, cost #{cost_s}s, waiting order in #{sleep_s}s"
 				trade = oms_wait_trade(pair, client_oid, sleep_s, :query_new)
 				if trade != nil
@@ -287,25 +312,29 @@ module URN
 
 				query_o = order.clone # Avoid overwriting order
 				query_o['client_oid'] = client_oid
-				begin
-					target = query_order(
-						pair, query_o,
-						allow_fail:false,
-						just_placed:true
-					)
-					unless target.nil?
-						post_place_order(target)
-						return target
+				start_t = Time.now.to_f
+				loop {
+					target = nil
+					begin
+						target = query_order(pair, query_o, allow_fail: true, just_placed:true)
+					rescue OrderNotExist
+						puts "Order not exsit".red
+						break
 					end
-				rescue OrderNotExist
-					if e.is_a?(OrderAlreadyPlaced)
-						puts "Retry querying order"
-						keep_sleep 5
-						retry
-					else
-						puts "Order not exsit"
+					if target.nil? # Failed
+						query_ttl_t = Time.now.to_f - start_t
+						if query_ttl_t > 600 && opt[:allow_fail] == true
+							puts "Too much time in querying this client_oid:\n#{JSON.pretty_generate(query_o)}"
+							break
+						else
+							sleep 60
+							next
+						end
 					end
-				end
+					post_place_order(target)
+					return target
+				}
+
 				return nil if opt[:allow_fail] == true
 				puts "No his exists, re-place order after.".blue
 				retry
@@ -319,6 +348,8 @@ module URN
 				raise "client_oid not consistent #{client_oid} #{trade['client_oid']}\n#{trade.to_json}"
 			end
 			post_place_order(trade)
+			# Gemini wont complain this error directly.
+			raise NotEnoughBalance.new(JSON.pretty_generate(trade)) if trade['type'] == 'rejected' && trade['reason'] == 'InsufficientFunds'
 			trade
 		end
 
@@ -332,35 +363,58 @@ module URN
 			end
 
 			json = nil
-			if pair.nil? # Pair could be null, will not able to use OMS in this case.
-				puts ">> #{order['i']} #{order['client_oid']}, skip OMS bc no pair"
-				res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
-				res = res[0] if res.is_a?(Array) && res.size == 1
-				json = res
-			else
-				order['pair']	= pair
-				json = oms_order_info(pair, order['i'], opt)
-				oms_missed = false
-				if json.nil?
+			wait_gap = 1
+			begin
+				if pair.nil? # Pair could be null, will not able to use OMS in this case.
+					puts ">> #{order['i']} #{order['client_oid']}, skip OMS bc no pair"
 					oms_missed = true
-					puts ">> #{order['i']} #{order['client_oid']}" if verbose
+					res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
+					res = res[0] if res.is_a?(Array) && res.size == 1
+					json = res
+				else
+					order['pair']	= pair
+					json = oms_order_info(
+						pair,
+						(order['i'] || order['client_oid'] || raise("No id in #{order.to_json}")),
+						opt
+					)
+					oms_missed = false
+					if json.nil?
+						oms_missed = true
+						puts ">> #{order['i']} #{order['client_oid']}" if verbose
 
-					if opt[:just_placed]
-						json = _async_operate_order(pair, order['i'], :query_new) {
+						if opt[:just_placed]
+							json = _async_operate_order(pair, order['client_oid'] || order['i'], :query_new) {
+								res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
+								res = res[0] if res.is_a?(Array) && res.size == 1
+								res
+							}
+						else
 							res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
 							res = res[0] if res.is_a?(Array) && res.size == 1
-							res
-						}
-					else
-						res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
-						res = res[0] if res.is_a?(Array) && res.size == 1
-						json = res
+							json = res
+						end
 					end
 				end
+			rescue OrderNotExist => e
+				if opt[:just_placed] # Sometimes order args have ['t'] too, cloned from other orders.
+					;
+				elsif order['t'] != nil && order_age(order) >= 1*3600_000
+					puts "Order is too old, mark this as closed\n#{format_trade(order)}"
+					order_set_dead(order)
+					post_cancel_order(order, order)
+					return order
+				end
+				raise e if order['i'].nil? # Pending orders
+				return nil if opt[:allow_fail] == true
+				keep_sleep wait_gap
+				wait_gap = [wait_gap+1, 20].min
+				raise e if wait_gap == 20 # Terminate barrier
+				retry
 			end
 			return nil if json.nil? && opt[:allow_fail] == true
 			trade = gemini_normalize_trade pair, json
-			oms_order_write_if_null(pair, order['i'], trade) if oms_missed
+			oms_order_write_if_null(pair || order['pair'], order['i'], trade) if oms_missed
 			post_query_order(order, trade, opt)
 			trade
 		end
@@ -373,13 +427,15 @@ module URN
 					gemini_req '/v1/order/cancel', args: args, allow_fail:opt[:allow_fail], cancel_order:true
 				}
 				return nil if json.nil? && opt[:allow_fail] == true
-			rescue => e
-				if e.message.include?('TODO')
-					puts "Known error, order is dead/invalid: #{e.message}".red
-					oms_order_delete(pair, order['i'])
-				else
-					raise e
+			rescue OrderNotExist => e
+				if order['t'] != nil && order_age(order) <= 10_000
+					puts "order is pretty new < 10 seconds, treat this as an error"
+					return nil if opt[:allow_fail] == true
+					puts "Retry after 3 seconds"
+					keep_sleep 3
+					retry
 				end
+				raise e
 			end
 			record_operation_time
 
@@ -401,7 +457,7 @@ module URN
 
 		def active_orders(pair, opt={})
 			verbose = @verbose && opt[:verbose] != false
-			json = gemini_req '/v1/orders', allow_fail:opt[:allow_fail]
+			json = gemini_req '/v1/orders', opt
 			return nil if json.nil? && opt[:allow_fail] == true
 			orders = []
 			json.each { |o|
@@ -428,22 +484,38 @@ module URN
 			open_orders.each { |o| order_by_id[o['i']] = o }
 
 			# Get all trades, extract order ids, then query them one by one
-			args = {
-				:limit_trades => 500,
-				:symbol => gemini_symbol(pair)
-			}
+			args = { :limit_trades => 100 } # Max 500
+			args[:symbol] = gemini_symbol(pair) if pair != nil
 			if opt[:timestamp] != nil # in second. Only return trades on or after this timestamp
 				args[:timestamp] = opt[:timestamp]
 			end
 			json = gemini_req '/v1/mytrades', args: args, allow_fail:opt[:allow_fail]
 			return nil if json.nil? && opt[:allow_fail] == true
 			puts "#{json.size} recent trades got" if @verbose
-			json.each { |t|
+			trades = json.select { |t|
+				# puts t.to_json
+				# "price":"0.05972","amount":"0.132","timestamp":1627261408,"timestampms":1627261408334,
+				# "type":"Sell","aggressor":false,"fee_currency":"BTC","fee_amount":"0.00000788304",
+				# "tid":49423497780,"order_id":"49423497317","exchange":"gemini","is_auction_fill":false,
+				# "is_clearing_fill":false,"symbol":"ETHBTC","client_order_id":"BTC-ETH_1678819584_967"
+				next true if pair.nil?
+				next gemini_standard_pair(t['symbol']) == pair
+			}
+			trades.each_with_index { |t, i|
 				next if order_by_id[t['order_id']] != nil # Skip known orders.
-				new_order = { 'i' => t['order_id'], 'market' => 'Gemini' }
-				new_order = query_order(nil, new_order, opt)
-				return nil if new_order.nil? && opt[:allow_fail] == true
-				order_by_id[t['order_id']] = new_order
+				cached_json = URN::OMSLocalCache.oms_info(market_name(), t['order_id'])
+				if cached_json != nil
+					cached_o = _normalize_trade(nil, JSON.parse(cached_json))
+					order_by_id[t['order_id']] = cached_o
+				else
+					new_order = { 'pair' => pair, 'i' => t['order_id'], 'market' => 'Gemini' }
+					puts "Querying #{i}/#{trades.size} OMS support? #{URN::OMSLocalCache.support_mkt?(market_name())}"
+					new_order = query_order(pair, new_order, opt)
+					return nil if new_order.nil? && opt[:allow_fail] == true
+					order_by_id[t['order_id']] = new_order
+					print "#{new_order['pair']}\n" if verbose && pair.nil?
+					print "#{format_trade(new_order)}\n" if verbose
+				end
 			}
 
 			orders = order_by_id.values.sort_by { |o| o['t'] }
@@ -468,29 +540,6 @@ module URN
 			}.to_h
 		end
 		expire_every MARKET_PAIRS_CACHE_T, :all_pairs
-
-		def market_summaries
-			raise "Not implemented"
-			begin
-				res = gemini_req_v3 '/markets/summaries', public:true
-				tick_res = gemini_req_v3 '/markets/tickers', public:true
-				tick_res = tick_res.map { |t| [t['symbol'], t] }.to_h
-				res = res.map do |r|
-					pair = gemini_standard_pair_v3(r['symbol'])
-					t = tick_res[r['symbol']] || {}
-					[pair, {
-						'last' => t['lastTradeRate'],
-						'vol' => r['quoteVolume']
-					}]
-				end.to_h
-				res['BTC-BCH'] = res.delete('BTC-BCC')
-				return res
-			rescue => e
-				APD::Logger.error e
-				keep_sleep 1
-				retry
-			end
-		end
 
 		#############################################
 		# Withdraw and deposit
@@ -520,13 +569,14 @@ module URN
 		end
 
 		def withdraw(asset, amount, address, opt={})
-			raise "Implemented, not test yet"
+			# Need a whitelist
+			raise "Cryptocurrency withdrawal address whitelists are not enabled for account primary. Please contact support@gemini.com for information on setting up a withdrawal address whitelist."
 			amount = amount.round(6)
 			asset = asset.upcase
 			asset = 'USD' if asset == 'GUSD' # https://docs.gemini.com/rest-api/#withdraw-usd-as-gusd
 			args = {
 				:address	=> address,
-				:amount => amount
+				:amount => amount.to_s
 			}
 			raise "Not implemented: withdraw with memo" if opt[:message] != nil
 			puts args
@@ -536,7 +586,7 @@ module URN
 			keep_sleep 10
 			res = nil
 			begin
-				res = gemini_req "/v1/addresses/#{asset.downcase}", args: args, allow_fail:opt[:allow_fail]
+				res = gemini_req "/v1/withdraw/#{asset.downcase}", args: args, allow_fail:opt[:allow_fail]
 			rescue => e
 				raise e
 			end
@@ -586,24 +636,93 @@ module URN
 		end
 
 		def market_summary(pair, opt={})
-			raise "Not implemented"
-			res = gemini_req_v3 "/markets/#{gemini_symbol_v3(pair)}/summary", public:true
-			raise "Market summary #{res.to_json}" unless res.is_a?(Hash)
-			tick = gemini_req_v3 "/markets/#{gemini_symbol_v3(pair)}/ticker", public:true
-			raise "Market ticker #{tick.to_json}" unless tick.is_a?(Hash)
-			chg = res['percentChange'].to_f / 100
-			{
-				'from'					=> DateTime.parse(res['updatedAt'])-1,
-				'open'					=> tick['lastTradeRate'].to_f / (1+chg),
-				'last'					=> tick['lastTradeRate'].to_f,
-				'high'					=> res['high'].to_f,
-				'low'						=> res['low'].to_f
+			res = redis_cached_call('candles_1day_'+pair, 60) {
+				gemini_req "/v2/candles/#{gemini_symbol(pair)}/1day", public:true, allow_fail: opt[:allow_fail]
 			}
+			return if res.nil? && opt[:allow_fail] == true
+			d = res.sort_by { |r| r[0] }.last
+			time, open, high, low, close, vol = d[0..5]
+			chg = close/open - 1
+			{
+				'from'					=> DateTime.now - 1,
+				'open'					=> open,
+				'last'					=> close,
+				'high'					=> high,
+				'low'						=> low,
+				'amt'						=> vol,
+				'vol'						=> vol*close
+			}
+		end
+
+		def market_summary_v1(pair, opt={})
+			res = redis_cached_call('pricefeed', 60) {
+				gemini_req "/v1/pricefeed", public:true, allow_fail: opt[:allow_fail]
+			}
+			return if res.nil? && opt[:allow_fail] == true
+			d = res.select { |x| x['pair'] == gemini_symbol(pair) }.first
+			return nil if d.nil?
+			chg = d['percentChange24h'].to_f / 100
+			last = d['price'].to_f
+			{
+				'from'					=> DateTime.now - 1,
+				'open'					=> last/(1+chg), 
+				'last'					=> last,
+				'high'					=> last,
+				'low'						=> last
+			}
+		end
+
+		def market_summaries
+			res = redis_cached_call('pricefeed', 60) {
+				gemini_req "/v1/pricefeed", public:true, allow_fail: opt[:allow_fail]
+			}
+			return if res.nil? && opt[:allow_fail] == true
+			res.map { |d|
+				pair = gemini_symbol(d['pair'])
+				chg = d['percentChange24h'].to_f / 100
+				last = d['price'].to_f
+				[pair, {
+					'last' => last,
+					'open' => last/(1+chg), 
+					'chg' => chg,
+					'vol' => 0
+				}]
+			}.to_h
+		end
+
+		def pair_to_underlying_pair(pair) # Dirty tricks to mapping pair -> trading pair
+			if pair =~ /^USDT-/
+				pair = pair.gsub(/^USDT/, 'USD')
+			end
+			pair
+		end
+		def underlying_pair_to_pair(pair) # Dirty tricks to mapping trading pair -> pair
+			if ['USD-STORJ'].include?(pair)
+				pair = pair.gsub('USD', 'USDT')
+			end
+			pair
+		end
+
+		def earn_balance(opt={})
+			verbose = @verbose && opt[:verbose] != false
+			res = gemini_req '/v1/balances/earn', opt
+			return nil if res.nil? && opt[:allow_fail] == true
+			# puts JSON.pretty_generate(res) if @verbose
+			res
+		end
+
+		def earn_products(opt={})
+			verbose = @verbose && opt[:verbose] != false
+			res = gemini_req '/v1/earn/rates/', opt
+			return nil if res.nil? && opt[:allow_fail] == true
+			puts JSON.pretty_generate(res) if @verbose
+			res
 		end
 
 		private
 		######### Format control #########
 		def gemini_symbol(pair)
+			pair = pair_to_underlying_pair(pair)
 			segs = pair.split('-')
 			(segs[1] + segs[0]).upcase
 		end
@@ -618,6 +737,7 @@ module URN
 				end
 			}
 			raise "Unexpected symbol #{symbol}" if pair.nil?
+			pair = underlying_pair_to_pair(pair)
 			pair
 		end
 		# Make order be standard format.
@@ -663,6 +783,14 @@ module URN
 			order['maker_size'] = order['remained'] = order['remaining_amount'].to_f
 			# "executed_amount": "0"
 			order['executed'] = order['executed_amount'].to_f
+			if order['remained'] == 0 && order['executed'] == 0
+				if order['type'] == 'rejected'
+					puts "order rejected #{JSON.pretty_generate(order)}".red
+					order['remained'] = order['s']
+				else
+					raise "Unknown case of order #{JSON.pretty_generate(order)}"
+				end
+			end
 
 			# Could parse trades list for precise maker_size calculation
 			# But trades list is not available from OMS ? check fill event TODO
@@ -675,7 +803,11 @@ module URN
 			when [false, true]
 				order['status'] = 'canceled'
 			when [false, false]
-				if order['remained'] == 0
+				if order['type'] == 'rejected'
+					order['status'] = 'canceled'
+				elsif order['type'] == 'closed' # Closed after maintain.
+					order['status'] = 'canceled'
+				elsif order['remained'] == 0
 					order['status'] = 'finished'
 				else
 					raise "Unexpected status #{JSON.pretty_generate(order)}"
@@ -689,6 +821,36 @@ module URN
 			order
 		end
 		alias_method :_normalize_trade, :gemini_normalize_trade
+
+		######### Rate limit control #########
+		# https://docs.gemini.com/rest-api/#rate-limits
+		# 	For public API entry points, we limit requests to 120 requests per minute, and recommend that you do not exceed 1 request per second.
+		# 	For private API entry points, we limit requests to 600 requests per minute, and recommend that you not exceed 5 requests per second.
+		#
+		# 	Example: 600 requests per minute is ten requests per second, meaning one request every 0.1 second.
+		#
+		# 	If you send 20 requests in close succession over two seconds, then you could expect:
+		#
+		# 	the first ten requests are processed
+		# 	the next five requests are queued
+		# 	the next five requests receive a 429 response, meaning the rate limit for this group of endpoints has been exceeded
+		# 	any further incoming request immediately receive a 429 response
+		# 	after a short period of inactivity, the five queued requests are processed
+		# 	following that, incoming requests begin to be processed at the normal rate again
+		def api_rate_rule
+			return {
+				'rule' => {
+					'weight' => [15, 1.5],
+					'order' => [15, 1.5]
+				},
+				'score' => {
+					'weight' => 15,
+					'order' => 15
+				},
+				'his' => [],
+				'extra' => []
+			}
+		end
 
 		private
 		def wss_key
@@ -719,7 +881,9 @@ module URN
 			timeout = 10
 			timeout = 10 if opt[:place_order] == true
 			req_time = nil
+			original_path = path
 			loop do
+				path = original_path
 				if opt[:place_order] == true || opt[:cancel_order] == true
 					return nil if opt[:allow_fail] == true && is_banned?()
 					wait_if_banned()
@@ -757,9 +921,23 @@ module URN
 					method = :POST
 				end
 
+				emergency_call = (opt[:cancel_order] == true || opt[:emergency_call] == true)
+				memo = "#{path} #{opt[:memo] || display_args_str} #{emergency_call ? "EMG".red : ""}"
+				loop {
+					break if opt[:skip_api_rate_control] == true
+					should_call = api_rate_control(1, emergency_call, memo, opt)
+					break if should_call
+					if should_call == false && opt[:allow_fail] == true
+						puts "Abort request because of rate control"
+						return nil
+					end
+					puts "Should not call api right now, wait: #{path} #{display_args_str}"
+					keep_sleep 1
+				}
+
 				url = "#{@GEMINI_API_DOMAIN}#{path}"
 				begin
-					payload = nil if payload.empty?
+					payload = nil if payload == {}
 					response, proxy = mkt_http_req(
 						method, url,
 						header: header, timeout: timeout,
@@ -784,9 +962,24 @@ module URN
 						puts ['API failed', e.class, e.message]
 						err_msg = e.message.to_s
 					end
+
+					err_json = nil
 					err_json = no_complain { JSON.parse(err_res) }
 
 					case (err_json || {})['reason']
+					when 'InvalidNonce'
+						return nil if opt[:allow_fail] == true
+						keep_sleep 3
+						next
+					when 'Maintenance'
+						now = DateTime.now
+						puts "System abnormality, maybe exchange is under maintenance."
+						t = banned_util()
+						if t.nil? || t < (now + 30.0/86400.0)
+							# Wait 30-90 seconds
+							t = (now + (30.0+Random.rand(90))/86400.0)
+							set_banned_util(t, "#{err_msg} #{err_res}")
+						end
 					when 'InsufficientFunds'
 						raise NotEnoughBalance.new(err_res)
 					when 'InvalidPrice'
@@ -797,21 +990,20 @@ module URN
 						raise ActionDisabled.new(err_res)
 					when /(Maintenance|System|MarketNotOpen)/
 						broadcast = ((err_json || {})['reason'].include?('MarketNotOpen') == false)
-						@could_be_banned = true # Normally it does not happpen
 						t = banned_util()
 						now = DateTime.now
 						if t.nil? || t < (now + 30.0/86400.0)
 							# Wait 30-90 seconds
 							t = (now + (30.0+Random.rand(90))/86400.0)
 							# Maybe only this market is offline, dont broadcast.
-							set_banned_util(t, err_res, broadcast:broadcast)
+							set_banned_util(t, "#{err_msg} #{err_res}", broadcast:broadcast)
 						end
 						return nil if opt[:allow_fail] == true
 					when 'OrderNotFound'
 						raise OrderNotExist.new(err_res)
 					when 'RateLimit'
-						@could_be_banned = true # Normally it does not happpen
 						t = banned_util()
+						now = DateTime.now
 						if t.nil? || t < (now + 3.0/1440.0)
 							# Wait 1-2 min
 							t = (now + (60.0+Random.rand(60))/14400.0)
@@ -819,26 +1011,43 @@ module URN
 						end
 						return nil if opt[:allow_fail] == true
 						next
+					when 'System'
+						# We are investigating technical issues with the Gemini Exchange.
+						# Please check https://status.gemini.com/ for more information.
+						t = banned_util()
+						now = DateTime.now
+						if t.nil? || t < (now + 3.0/1440.0)
+							# Wait 1-2 min
+							t = (now + (60.0+Random.rand(60))/14400.0)
+							set_banned_util(t, "#{err_msg} #{err_res}")
+						end
+						return nil if opt[:allow_fail] == true
+						keep_sleep 60
+						next
 					else
-						puts "Unexpected error code #{err_json}"
-						raise e
+						if err_res.empty? || err_json.nil?
+							; # Empty response caused by timeout or other reasons.
+						else
+							puts "Unexpected error code [#{err_json}]"
+							raise e
+						end
 					end
 
 					raise OrderMightBePlaced.new if opt[:place_order] == true
 					return nil if opt[:allow_fail] == true
 					keep_sleep 3
-					retry if e.is_a?(HTTP::Error)
-					retry if normal_api_error?(e)
+					next if e.is_a?(HTTP::Error)
+					next if normal_api_error?(e)
 					raise e
 				rescue ThreadError => e
 					puts e.message
 					keep_sleep 1
-					retry if (e.message || '').include?('Resource temporarily unavailable')
+					next if (e.message || '').include?('Resource temporarily unavailable')
 					raise e
 				rescue OpenSSL::SSL::SSLError, Errno::ECONNREFUSED, SocketError, Errno::EHOSTUNREACH, Errno::ETIMEDOUT, Errno::ENETUNREACH, Errno::ECONNRESET, Errno::EPIPE => e
 					puts e.message
 					return nil if opt[:allow_fail] == true
-					retry
+					next
 				end
 			end
 		end
