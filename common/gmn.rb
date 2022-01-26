@@ -697,7 +697,7 @@ module URN
 			pair
 		end
 		def underlying_pair_to_pair(pair) # Dirty tricks to mapping trading pair -> pair
-			if ['USD-STORJ'].include?(pair)
+			if ['USD-STORJ', 'USD-CVC'].include?(pair)
 				pair = pair.gsub('USD', 'USDT')
 			end
 			pair
@@ -840,12 +840,12 @@ module URN
 		def api_rate_rule
 			return {
 				'rule' => {
-					'weight' => [15, 1.5],
-					'order' => [15, 1.5]
+					'weight' => [12, 1.2], # burst 10~15
+					'order' => [12, 1.2]
 				},
 				'score' => {
-					'weight' => 15,
-					'order' => 15
+					'weight' => 12,
+					'order' => 12
 				},
 				'his' => [],
 				'extra' => []

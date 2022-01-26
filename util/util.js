@@ -95,9 +95,6 @@ exp.getCliPairs = function() {
 	} else if (args[0].toUpperCase() == 'USD' && args.length > 1) {
 		base = 'USD';
 		args = args.slice(1);
-	} else if (args[0].toUpperCase() == 'ETH' && args.length > 1) {
-		base = 'ETH';
-		args = args.slice(1);
 	}
 	for (var i in args)
 		if (args[i].split('-').length >= 2)

@@ -1983,7 +1983,7 @@ module URN
 # 				end
 # 			end
 # 			raise "Symbol #{symbol} should end with btc/eth/bnb/usd/usdt" if pair.nil?
-			pair = @binance_symbol_info[symbol]
+			pair = @binance_symbol_pair[symbol]
 			raise "Symbol #{symbol} does not exist" if pair.nil?
 			pair = underlying_pair_to_pair(pair)
 			pair

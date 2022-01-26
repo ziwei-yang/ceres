@@ -97,7 +97,7 @@ module URN
 					end
 				end
 				if ['buy', 'bid'].include?(type.strip.downcase) && market_name() == 'FTX' && asset1 == 'USD'
-					remain = 200_000 # To buy with USD, keep at least 200K USD in FTX for futures margin.
+					remain = 350_000 # To buy with USD, keep at least XXXK USD in FTX for futures margin.
 				elsif ['buy', 'bid'].include?(type.strip.downcase) && market_name() == 'FTX' && asset1 == 'BTC'
 					remain = 30 # To buy with BTC, keep at least 30 BTC in FTX for futures margin.
 				elsif ['sell', 'ask'].include?(type.strip.downcase) && market_name() == 'FTX' && asset2 == 'BTC'
@@ -560,7 +560,7 @@ module URN
 			return balance_cache_update_int(trade, opt)
 		end
 		def balance_cache_update_int(trade, opt={})
-			verbose = @verbose && opt[:verbose] != false
+			verbose = @verbose && opt[:verbose] == true
 			recover_reserved = opt[:recover_reserved] == true
 			recover_reserved_deduct_cash = opt[:recover_reserved_deduct_cash] == true
 			replace_order = opt[:replace_order] == true
@@ -805,7 +805,7 @@ module URN
 		def client_register(client)
 			@trade_clients ||= []
 			return if @trade_clients.include?(client)
-			puts "Add market_client for #{client.market_name}"
+			puts "Add market_client for #{client.market_name} #{client.given_name}"
 			@trade_clients.push client
 			client
 		end
@@ -1934,7 +1934,7 @@ module URN
 					oldest_order_rec_ms ||= h[0]
 				end
 			}
-			current_weight_score = [current_weight_score, 0].max
+			current_weight_score = [current_weight_score, 0].max.round(1)
 			current_order_score = [current_order_score, 0].max
 			ratio = current_weight_score/weight_max_score.to_f
 			order_width = (screen_width/2).floor-2 # fixed width instead of [order_max_score, 34].max
@@ -1987,8 +1987,8 @@ module URN
 						extra = data['extra'] || [false, 'NULL', 0, false]
 						could_call, memo, weight, place_order = extra[0..3]
 						weight_str = weight.to_s.ljust(3)
-						order_score = data.dig('score', 'order').to_s.rjust(3)
-						weight_score = data.dig('score', 'weight').to_s.rjust(4)
+						order_score = data.dig('score', 'order').round(1).to_s.rjust(3)
+						weight_score = data.dig('score', 'weight').round(1).to_s.rjust(4)
 						if place_order
 							str = " #{weight_score} ORD #{order_score} #{memo}"
 						else
@@ -2132,7 +2132,7 @@ module URN
 			order_limit = data.dig('rule', 'order')
 			emergency_order_quota = (0.1 * order_limit[0]).ceil
       if market_name() == 'Binance' # Use more harsh limit on Binance
-        emergency_order_quota = (0.15 * order_limit[0]).ceil
+        emergency_order_quota = (0.2 * order_limit[0]).ceil
       end
 
 			if emergency_call == true # Still keep some quota in case of competetion.
@@ -2196,6 +2196,8 @@ module URN
 					over_quota = current_weight_score - (weight_limit[0] - emergency_weight_quota)
 				end
 			end
+			# Bittrex only ban closed orders and public APIs.
+			could_call = true if market_name() == 'Bittrex' && weight <= 1
 
 			# Update score and prepare message.
 			if could_call
@@ -2466,6 +2468,8 @@ module URN
 					;
 				elsif order['pair'] == 'BTC-ETH' && order['p'] * order['remained'] <= 1000*SATOSHI
 					; # Tolernce little more for ETH
+        elsif order['pair'].start_with?('USD') && order['p'] * order['remained'] <= 0.01
+          ; # $0.01 for USD pairs
 				else
 					raise "Order is still alive:\n#{JSON.pretty_generate(order)}"
 				end
@@ -3058,22 +3062,27 @@ module URN
 			assets = opt[:assets] # Customized filter
 			s = "Balance [#{head}] - " + market_name()
 			logs.push s
+			keys = @balance_cache.keys.sort
 			if market_type() == :future
 				s = "#{'Bal'.ljust(16)} #{format_num('CASH', 8)} #{format_num("CASH_V", 8)} #{format_num('RESERVED', 8)} #{format_num('PENDING', 4)}"
 				logs.push s
-				@balance_cache.each do |k, v|
+				keys.each { |k|
+					v = @balance_cache[k]
+					next if v.nil?
 					next if assets != nil && assets.include?(k) == false
 					s = "#{(k||'N/A').ljust(24)} #{format_num(v['cash'], 8)} #{(v['cash_v'] || '').to_s.rjust(8)} #{format_num(v['reserved'], 8)} #{format_num(v['pending']||0, 4)}"
 					logs.push s
-				end
+				}
 			else
 				s = "#{'Bal'.ljust(16)} #{format_num('CASH', 8)} #{format_num('RESERVED', 8)} #{format_num('PENDING', 4)}"
 				logs.push s
-				@balance_cache.each do |k, v|
+				keys.each { |k|
+					v = @balance_cache[k]
+					next if v.nil?
 					next if assets != nil && assets.include?(k) == false
 					s = "#{(k||'N/A').ljust(24)} #{format_num(v['cash'], 8)} #{format_num(v['reserved'], 8)} #{format_num(v['pending']||0, 4)}"
 					logs.push s
-				end
+				}
 			end
 			logs.each { |s| print "#{s}\n" }
 			logs
@@ -4105,28 +4114,54 @@ module URN
 					(order['p'] || trade['p']).round(10) != trade['p'].round(10) ||
 					(order['T'] || trade['T']) != trade['T']
 				exception_expected = false
-				# Only in bitstamp:
-				# If placed order is pretty new and zero filled, its price might be changed better because of latency, longest time seen: 287s.
-				if market_name() == 'Bitstamp' && order['executed'] == 0 && trade['executed'] > 0 && order_age(order) < 360_000 && (order['T'] || trade['T']) == trade['T'] && order['p'] != nil
-					if order['T'] == 'buy' && trade['p'] < order['p']
-						exception_expected = true
-					elsif order['T'] == 'sell' && trade['p'] > order['p']
-						exception_expected = true
-					end
-				end
+				# Only in bitstamp: longest time seen: 287s.
+        # new order filled/partial-filled in short time, its price might be changed a little.
+				test_cond = [
+          market_name() == 'Bitstamp',
+          trade['executed'] > 0,
+          order_age(order) < 360_000,
+          order['p'] != nil,
+          (order['executed'] || 0) < trade['executed'],
+          (order['T'] || trade['T']) == trade['T'],
+          (order['s'] || trade['s']) == trade['s']
+        ]
+        err_msg = test_cond.join(' ')
+        if test_cond.uniq == [true]
+          if (order['executed'] || 0) == 0
+            err_msg += " p #{order['p']}, #{trade['p']}"
+            # Price could only go better for its first fill.
+            if order['T'] == 'buy' && trade['p'] < order['p']
+              exception_expected = true
+            elsif order['T'] == 'sell' && trade['p'] > order['p']
+              exception_expected = true
+            end
+          else
+            err_msg += " diff_p #{diff(order['p'], trade['p']).abs}"
+            # Price might be: arg ---> better ---> worse but still better than arg.
+            if diff(order['p'], trade['p']).abs <= 0.005
+              exception_expected = true
+            end
+          end
+        end
 				unless exception_expected
 					puts order.to_json
 					puts trade.to_json
 					puts ((order['executed'] || trade['executed']) > trade['executed'])
 					puts (order['p'] || trade['p']).round(10) != trade['p'].round(10)
 					puts ((order['T'] || trade['T']) != trade['T'])
-					raise "Unconsistent order:\n#{format_trade(order)}\n#{format_trade(trade)}"
+          raise "Unconsistent order:\n#{format_trade(order)}\n#{format_trade(trade)}\n#{err_msg}"
 				end
 			end
-			# Step 3: Keep max maker_size
+      # Step 3: Keep max maker_size, if order not managed.
+      # Keep managed order maker_size, if order managed.
 			maker_s_1 = old_o['maker_size'] || old_o['remained'] || 0
 			maker_s_2 = new_o['maker_size'] || new_o['remained'] || 0
-			maker_s = [maker_s_1, maker_s_2].max
+      managed_o = order_managed(new_o['pair'], new_o['i'])
+      if managed_o.nil?
+        maker_s = [maker_s_1, maker_s_2].max
+      else
+        maker_s = managed_o['maker_size'] || [maker_s_1, maker_s_2].max
+      end
 			new_o['maker_size'] = old_o['maker_size'] = maker_s
 			# Step 4: Copy custom data
 			if old_o['_data'].nil?
@@ -4261,6 +4296,9 @@ module URN
 			if asset_bal.nil? && opt[:allow_fail] == true
 				puts "Failed in querying balance for #{from_mkt}".red
 				return nil
+			elsif asset_bal.dig(asset).nil?
+				puts "No balance record for #{from_mkt}".red
+				return nil
 			elsif asset_bal.dig(asset, 'cash') > amount * 1.1
 				puts "#{from_mkt} has #{asset_bal.dig(asset, 'cash')}, dont need to cancel orders".green
 				cancel_order_before = false
@@ -4273,19 +4311,32 @@ module URN
 			end
 			puts "to prepare #{amount} #{asset} cancel_order_before #{cancel_order_before}".red
 			if cancel_order_before
-				pairs = all_pairs().keys.select { |p| p.include?("-#{asset}") }
-				based_pairs = all_pairs().keys.select { |p| p.include?("#{asset}-") }
+				# Cancel order for spot pairs only. (FTX)
+				pairs = all_pairs().keys.select { |p| p.include?("-#{asset}") && !(is_future?(p)) }
+				based_pairs = all_pairs().keys.select { |p| p.include?("#{asset}-") && !(is_future?(p)) }
 				could_be_base = (URN::USD_TOKENS + ['BTC', 'USD', 'ETH', 'TRX']).include?(asset)
+				cli_mode = (opt[:mode] == 'CLI')
 				# Ask all related bots to pause 30 or 90 seconds.
 				command = nil
 				if asset == 'BNB'
 					puts "Do nothing for BNB, don't pause markets.".green
 				elsif could_be_base
 					puts "Sending URANUS:command --> pause90 #{asset}".red # pause90 USDT
-					command = [Time.now.to_i, "pause60 #{asset}-"].to_json
+					command = [Time.now.to_i, "pause90 #{asset}-"].to_json
 				else
 					puts "Sending URANUS:command --> pause30 #{asset}".red # pause30 DOGE
 					command = [Time.now.to_i, "pause30 -#{asset}"].to_json
+				end
+
+				if cli_mode
+					loop {
+						wait_s = get_input prompt:"Enter or change command #{command} before canceling affected orders"
+						if wait_s.to_i > 0
+							command = command.gsub(/pause[0-9][0-9]/, "pause#{wait_s.to_i}")
+							next
+						end
+						break
+					}
 				end
 
 				if command != nil
@@ -4331,6 +4382,7 @@ module URN
 						end
 					}
 				end
+				puts "Executed command: #{command}"
 			end
 		end
 
@@ -4794,6 +4846,7 @@ module URN
 		include URN::CLI
     def run_cli(args=ARGV.clone)
       return run_cli_int(ARGV) if args.size > 0
+			@_cli_mode = true
       # Interactive CLI mode if no args given
 			if oms_enabled?
 				URN::OMSLocalCache.monitor(
@@ -4801,6 +4854,7 @@ module URN
 					[Thread.current], wait:true
 				)
 			end
+			last_args = []
       loop {
         print "\n#{market_name()} #{account_name()} >"
         input = get_input()
@@ -4808,7 +4862,9 @@ module URN
         input = input.strip
         next if input.empty?
         args = input.split(' ')
+				args = last_args if input == "\e[A" # up arrow
         begin
+					last_args = args
           run_cli_int(args)
         rescue => e
           APD::Logger.error e
@@ -4941,8 +4997,9 @@ module URN
 				full_pairs = all_pairs()
 				# If pair is not valid, select a list of pairs for it.
 				if full_pairs.include?(pair) == false
-					filtered_pairs = full_pairs.keys.select { |p| p.include?(asset) }
+					filtered_pairs = full_pairs.keys.select { |p| p.end_with?(asset) || p.start_with?(asset) }
 					puts "#{filtered_pairs.size} pairs filtered by #{asset}".blue
+					puts "No such pair #{asset}".red if filtered_pairs.empty?
 				else
 					pair = determine_pair(pair)
 				end
@@ -4985,6 +5042,19 @@ module URN
 				return
 			elsif args[0] == 'alive' # client.rb alive
 				active_orders(nil)
+				return
+			elsif args[0] == 'prepare' # client.rb prepare uni 5000
+				asset = args[1]
+				amount = args[2].to_f
+				raise "No asset to prepare" if asset.nil?
+				raise "No amount to prepare" if amount <= 0
+
+				prepare_enough_balance(asset.upcase, amount, mode: 'CLI')
+				unless @_cli_mode
+					puts "Enter CLI to use asset balance now."
+					ARGV.clear
+					run_cli()
+				end
 				return
 			elsif args[0] == 'funding'
 				his = funding_fee_history(nil)
@@ -5228,9 +5298,15 @@ module URN
 				id = args[2].strip
 				if filtered_pairs != nil
 					puts "Cancelling #{filtered_pairs.join(',')} #{id}"
-					orders = active_orders(nil).select { |o|
-						filtered_pairs.include?(o['pair'])
-					}
+					if filtered_pairs.size >= 8
+						puts "Querying all orders"
+						orders = active_orders(nil, verbose: false).select { |o| filtered_pairs.include?(o['pair']) }
+					else
+						orders = filtered_pairs.map { |p|
+							puts "Querying #{p} orders"
+							active_orders(p, verbose: false)
+						}.reduce(:+) || []
+					end
 					puts "Active orders: #{filtered_pairs.join(',')} #{orders.size} found"
 					orders.each { |o|
 						puts "#{o['pair'].ljust(10)} #{o['i']}\n#{format_trade(o)}"
@@ -5378,9 +5454,15 @@ module URN
 			# List orders at last by default.
 			if filtered_pairs != nil
 				puts "Active orders: #{filtered_pairs.join(',')}"
-				orders= active_orders(nil).select { |o|
-					filtered_pairs.include?(o['pair'])
-				}
+				if filtered_pairs.size >= 8
+					puts "Querying all orders"
+					orders = active_orders(nil, verbose: false).select { |o| puts o['pair']; filtered_pairs.include?(o['pair']) }
+				else
+					orders = filtered_pairs.map { |p|
+						puts "Querying #{p} orders"
+						active_orders(p, verbose: false)
+					}.reduce(:+) || []
+				end
 				puts "Active orders: #{filtered_pairs.join(',')} #{orders.size} found"
 			else
 				puts "Active orders: #{pair}"
