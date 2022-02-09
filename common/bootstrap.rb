@@ -508,6 +508,7 @@ module URN
 
 	module EmailUtil
 		def email_plain(receiver, subject, content, bcc = nil, opt={})
+			opt[:allow_fail] = true if opt[:allow_fail].nil? # Default allow_fail
 			if opt[:skip_dup] != false
 				@sent_emails ||= {}
 				last_sent_t = @sent_emails["#{receiver}/#{subject}"]
@@ -529,6 +530,10 @@ module URN
 				rescue ThreadError => e
 					sleep 1
 					retry if (e.message || '').include?('Resource temporarily unavailable')
+					return if opt[:allow_fail] == true
+					raise e
+				rescue
+					return if opt[:allow_fail] == true
 					raise e
 				end
 			end

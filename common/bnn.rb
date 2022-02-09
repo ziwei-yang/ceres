@@ -38,7 +38,7 @@ module URN
 				timeout = 10
 				timeout = 60 if opt[:place_order] == true
 				return nil if opt[:allow_fail] == true && is_banned?()
-				wait_if_banned()
+				wait_if_banned() unless opt[:wss_key] == true
 	
 				account = opt[:account]
 				method = opt[:method] || :GET
@@ -53,6 +53,7 @@ module URN
 				memo = "#{path} #{opt[:memo] || display_args_str} #{emergency_call ? "EMG".red : ""}"
 				loop {
 					break if opt[:skip_api_rate_control] == true
+					break if opt[:wss_key] == true
 					break if @binance_rate_control == false
 					should_call = api_rate_control(weight, emergency_call, memo, opt)
 					break if should_call
@@ -595,33 +596,56 @@ module URN
 			new_opt[:allow_fail] = true # Always request with allow_fail:true
 			new_opt[:weight] = 10
 			new_opt[:emergency_call] = true
+
+			binance_symbol_info() # Reload all trading fee by symbols.
+			# Account has universal trading fee data.
 			json = redis_cached_call("V3Account", 60, new_opt) {
 				binance_req '/api/v3/account', new_opt
 			}
-			if json.nil? && opt[:allow_fail].nil?
-				puts "Fallback to highest fee rate."
+
+			tk_comm = mk_comm = nil
+			# BUSD pairs seems have wrong fee data in @binance_trading_fee
+			# Use USDT-BTC fee as universal fee instead.
+			if false && @binance_trading_fee[pair] != nil
+				# Load from specific pair fee data
+				mk_comm = @binance_trading_fee.dig(pair, 'maker')
+				tk_comm = @binance_trading_fee.dig(pair, 'taker')
+			elsif false && @binance_trading_fee[pair_to_underlying_pair(pair)] != nil
+				# Load from specific pair fee data.
+				mk_comm = @binance_trading_fee.dig(pair_to_underlying_pair(pair), 'maker')
+				tk_comm = @binance_trading_fee.dig(pair_to_underlying_pair(pair), 'taker')
+			elsif @binance_trading_fee['USDT-BTC'] != nil
+				# Load from USDT-BTC fee data.
+				mk_comm = @binance_trading_fee.dig('USDT-BTC', 'maker')
+				tk_comm = @binance_trading_fee.dig('USDT-BTC', 'taker')
+			elsif json != nil
+				# Load from universal fee data.
+				mk_comm = (json['makerCommission'].to_f/10000.0).round(8)
+				tk_comm = (json['takerCommission'].to_f/10000.0).round(8)
+			elsif opt[:allow_fail] == true
+				# Cache failed error.
+				raise APD::ExpireResultFailed.new
+			else
+				# Fallback to highest fee.
 				tk_comm = mk_comm = 0.1/100
+			end
+			# 75~78% BNB discount only applied when maker fee > 0
+			cash, asset = pair.split('-')
+			if mk_comm > 0 # Discount applies on positive fee only.
 				map = {
 					'maker/buy' => mk_comm*0.78,
 					'maker/sell' => mk_comm*0.78,
 					'taker/buy' => tk_comm*0.78,
 					'taker/sell' => tk_comm*0.78
 				}
-				map = map.to_a.map { |kv| [kv[0], kv[1].round(10)] }.to_h
-				@_fee_rate_real[pair] = map
-				return @_fee_rate_real[pair]
-			elsif json.nil? && opt[:allow_fail] == true
-				raise APD::ExpireResultFailed.new
+			else
+				map = {
+					'maker/buy' => mk_comm,
+					'maker/sell' => mk_comm,
+					'taker/buy' => tk_comm,
+					'taker/sell' => tk_comm
+				}
 			end
-			mk_comm = (json['makerCommission'].to_f/10000.0).round(8)
-			tk_comm = (json['takerCommission'].to_f/10000.0).round(8)
-
-			map = {
-				'maker/buy' => mk_comm*0.78,
-				'maker/sell' => mk_comm*0.78,
-				'taker/buy' => tk_comm*0.78,
-				'taker/sell' => tk_comm*0.78
-			}
 			map = map.to_a.map { |kv| [kv[0], kv[1].round(10)] }.to_h
 			@_fee_rate_real[pair] = map
 		end
@@ -743,6 +767,45 @@ module URN
 				@binance_symbol_pair = symbol_pair
 				@binance_pair_symbol = pair_symbol
 			end
+
+			# Load trading fee by symbol
+			if @binance_trading_fee.nil?
+				begin
+					puts "Try to load trading fee from webpage"
+					res = redis_cached_call("trading_fee", 600) {
+						file_cached_call('trading_fee', call_first: true) {
+							res = binance_req '/sapi/v1/asset/tradeFee', method: :GET, allow_fail:true, weight: 1
+						}
+					}
+				rescue => e
+					APD::Logger.error e
+					puts "Unknown error, try loading trading fee from file."
+					res = file_cached_call('trading_fee') { next nil }
+				end
+				trading_fee_map = {}
+				res.each { |d|
+					# "symbol": "1INCHBTC",
+					# "makerCommission": "0.0009",
+					# "takerCommission": "0.001"
+					sym = d['symbol']
+					p = @binance_symbol_pair[sym]
+					if p.nil?
+						puts "No pair for #{sym} in trading_fee data #{d}"
+						next
+					end
+					mk_fee, tk_fee = d['makerCommission'], d['takerCommission']
+					if mk_fee.nil? || tk_fee.nil?
+						puts "No fee for #{sym} in trading_fee data #{d}"
+						next
+					end
+					trading_fee_map[p] = {
+						'maker' => mk_fee.to_f.round(8),
+						'taker' => tk_fee.to_f.round(8)
+					}
+				}
+				@binance_trading_fee = trading_fee_map
+			end
+
 			return @binance_symbol_info if pair.nil?
 			ret = @binance_symbol_info[binance_symbol(pair)]
 			raise "symbol info is not exist for #{pair}" if ret.nil?
@@ -790,6 +853,7 @@ module URN
 			s
 		end
 
+		include URN::EmailUtil # For bug reporting.
 		def place_order(pair, order, opt={})
 			order = order.clone
 			return nil if pre_place_order(pair, order) == false
@@ -885,6 +949,7 @@ module URN
 			query_o['i'] = json['orderId'].to_s
       query_o['client_oid'] = client_oid
 			query_o['s'] = args[:quantity].to_f
+			query_o['t'] = place_time_i
 			raise "No order id" if query_o["i"].nil?
 			# Once the order id got, should query the order without allow_fail option.
 			# Binance_BUG01 : sometimes it returns wrong order while querying new placed order id.
@@ -896,13 +961,31 @@ module URN
 					trade['s'].round(8) == query_o['s'].round(8) && 
 					trade['t'] >= place_time_i
 					break
+				elsif trade['p'].round(8) == query_o['p'].round(8) &&
+					trade['t'] >= place_time_i
+					# Sometimes Binance would change its size, alert w/ email
+					diff = query_o['s'] - trade['s']
+					puts "Binance BUG01, order size changed #{trade.to_json}\n-> #{query_o.to_json}"
+					if URN::REPORT_RECIPIENT != nil
+						title = "#{market_name()} #{pair} order size bug #{query_o['s']} -> #{trade['s']}"
+						content = [
+							"args: #{args}",
+							"order: #{query_o.to_json}",
+							"trade: #{trade.to_json}",
+							format_trade(query_o).uncolorize,
+							format_trade(trade).uncolorize
+						]
+						puts content.join("\n")
+						email_plain URN::REPORT_RECIPIENT, title, content.join("\n<p/>")
+					end
+					break
 				else
 					info = [trade['p'], query_o['p'], trade['s'], query_o['s'], trade['t'], place_time_i]
 					puts "Binance_BUG01 triggered #{info}, clear cache and retry querying after 1s"
-          if URN::OMSLocalCache.support_mkt?(market_name())
-            URN::OMSLocalCache.oms_delete(market_name(), client_oid)
-            URN::OMSLocalCache.oms_delete(market_name(), query_o['i'])
-          end
+					if URN::OMSLocalCache.support_mkt?(market_name())
+						URN::OMSLocalCache.oms_delete(market_name(), client_oid)
+						URN::OMSLocalCache.oms_delete(market_name(), query_o['i'])
+					end
 					keep_sleep 1
 				end
 			}
@@ -1225,6 +1308,8 @@ module URN
 			res = redis_cached_call("klines_#{pair}", 600) {
 				binance_req '/api/v3/klines', public:true, args:args, weight: 1
 			}
+			# pair might be just listed, trading not started yet, duplicate candle.
+			res[1] = res[0] if res.size == 1
 			raise "Market summary size is #{res.size}: #{JSON.pretty_generate(res)}" unless res.size == 2
 			# time, open, high, low, close
 			{

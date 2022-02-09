@@ -428,8 +428,8 @@ module URN
 				}
 				return nil if json.nil? && opt[:allow_fail] == true
 			rescue OrderNotExist => e
-				if order['t'] != nil && order_age(order) <= 10_000
-					puts "order is pretty new < 10 seconds, treat this as an error"
+				if order['t'] != nil && order_age(order) <= 20_000 # Longest latency seen: 10s
+					puts "order is pretty new < 20 seconds, treat this as an error"
 					return nil if opt[:allow_fail] == true
 					puts "Retry after 3 seconds"
 					keep_sleep 3

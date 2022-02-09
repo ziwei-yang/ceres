@@ -414,12 +414,12 @@ module URN
 				end
 				if opt[:verbose] == true
 					puts [
-						"Pair #{contract}",
-						"cost #{cost} #{asset1}",
-						"position #{position} #{asset2}",
-						"Max lev #{lev}",
-						"cost w/ lev #{value} #{cost_on_quote ? asset1 : asset2}"
-					].join(', ')
+						contract.ljust(16),
+						"cost #{asset1.ljust(8)} #{format_num(cost, 4)}",
+						"pos #{format_num(position, 4)}",
+						"Max lev #{format_num(lev, 1)}",
+						"cost w/ lev #{format_num(value, 4)} #{cost_on_quote ? asset1 : asset2}"
+					].join(' ')
 				end
 			}
 			available_cash = (cash_balance - long_cost - short_cost).floor(8)
@@ -1130,9 +1130,9 @@ module URN
 			p_real = 0
 			p = mkt_client.format_price_str order['pair'], order['T'], order['p'], adjust:true, num:true
 			if order['T'] == 'buy'
-				p_real = (p/(1-rate)).floor(precise)
+				p_real = (p*(1+rate)).floor(precise) # /(1-rate) could bring negative value
 			elsif order['T'] == 'sell'
-				p_real = (p*(1-rate)).ceil(precise)
+				p_real = (p/(1+rate)).ceil(precise) # *(1-rate) could bring negative value
 			else
 				raise "Unknown order type #{order}"
 			end
@@ -1173,10 +1173,10 @@ module URN
 			end
 			if order['T'] == 'buy'
 				order['p_real'] = p_real.floor(precise)
-				order['p'] = (order['p_real']*(1-rate)).floor(precise)
+				order['p'] = (order['p_real']/(1+rate)).floor(precise) # /(1-rate) could bring negative value
 			elsif order['T'] == 'sell'
 				order['p_real'] = p_real.ceil(precise)
-				order['p'] = (order['p_real']/(1-rate)).ceil(precise)
+				order['p'] = (order['p_real']*(1+rate)).ceil(precise) # *(1-rate) could bring negative value
 			else
 				raise "Unknown order type #{order}"
 			end
@@ -2762,9 +2762,17 @@ module URN
 			return '' if his.nil? && opt[:allow_fail] == true
 			rate_records = his['rate_apy'] # From latest to oldest
 			rate_records = rate_records.map { |r| r.to_f/100 }
-			if market_name() != 'FTX'
+			funding_hr = nil
+			if market_name() == 'FTX'
+				funding_hr = 1
+			elsif market_name() == 'Bybit' || market_name() == 'BybitU'
+				funding_hr = funding_interval_hour(pair)
+			else
+				funding_hr = 8
+			end
+			if funding_hr > 1
 				rec_by_hour = []
-				rate_records.each { |a| 8.times { rec_by_hour.push a }}
+				rate_records.each { |a| funding_hr.times { rec_by_hour.push a }}
 				rate_records = rec_by_hour
 			end
 			chart_string(rate_records)
@@ -3843,7 +3851,12 @@ module URN
 						trade = _normalize_trade(pair, oms_json)
 						return trade
 					elsif mode == :cancel
-						trade = _normalize_trade(pair, oms_json)
+						if market_name() == 'Coinbase' && opt[:force_update] != nil
+							query_o = opt[:force_update] # To recover coinbase order size if needed.
+							trade = _normalize_trade(pair, oms_json, size: query_o['s'])
+						else
+							trade = _normalize_trade(pair, oms_json)
+						end
 						if order_alive?(trade) == false
 							puts "Dead order #{id} found \##{wait_ct}"
 							return trade
@@ -4318,20 +4331,24 @@ module URN
 				cli_mode = (opt[:mode] == 'CLI')
 				# Ask all related bots to pause 30 or 90 seconds.
 				command = nil
+				pause_t = 0
 				if asset == 'BNB'
 					puts "Do nothing for BNB, don't pause markets.".green
 				elsif could_be_base
 					puts "Sending URANUS:command --> pause90 #{asset}".red # pause90 USDT
 					command = [Time.now.to_i, "pause90 #{asset}-"].to_json
+					pause_t = 90
 				else
 					puts "Sending URANUS:command --> pause30 #{asset}".red # pause30 DOGE
 					command = [Time.now.to_i, "pause30 -#{asset}"].to_json
+					pause_t = 30
 				end
 
 				if cli_mode
 					loop {
 						wait_s = get_input prompt:"Enter or change command #{command} before canceling affected orders"
 						if wait_s.to_i > 0
+							pause_t = wait_s.to_i
 							command = command.gsub(/pause[0-9][0-9]/, "pause#{wait_s.to_i}")
 							next
 						end
@@ -4342,47 +4359,64 @@ module URN
 				if command != nil
 					endless_retry(sleep:1) { redis().set("URANUS:command", command) }
 				end
-				# Cancel all related orders.
-				if (pairs + based_pairs).uniq.size <= 5
-					# Cancel by pair
-					(pairs + based_pairs).uniq.sort.each { |pair|
-						puts "Getting #{from_mkt} #{pair} orders"
-						orders = active_orders(pair, allow_fail: true)
-						if orders.nil?
-							puts "Failed in getting #{from_mkt} #{pair} orders, hope this does not affect".red
-						else
-							if pairs.include?(pair)
-								orders = orders.select { |o| o['T'] == 'sell' }
-							elsif based_pairs.include?(pair)
-								orders = orders.select { |o| o['T'] == 'buy' }
+				start_t = Time.now
+				loop {
+					cancel_ct = 0
+					# Cancel all related orders.
+					if (pairs + based_pairs).uniq.size <= 5
+						# Cancel by pair
+						(pairs + based_pairs).uniq.sort.each { |pair|
+							puts "Getting #{from_mkt} #{pair} orders"
+							orders = active_orders(pair, allow_fail: true)
+							if orders.nil?
+								puts "Failed in getting #{from_mkt} #{pair} orders, hope this does not affect".red
+							else
+								if pairs.include?(pair)
+									orders = orders.select { |o| o['T'] == 'sell' }
+								elsif based_pairs.include?(pair)
+									orders = orders.select { |o| o['T'] == 'buy' }
+								end
+								cancel_ct += orders.size
+								ret = cancel_orders(pair, orders, allow_fail: true)
+								if ret.nil?
+									puts "Failed in canceling #{from_mkt} #{pair} orders, hope this does not affect".red
+								end
 							end
+						}
+					else
+						# Fetch all orders, filter by pairs
+						orders = active_orders(nil)
+						orders_by_pair = {}
+						orders = orders.select { |o|
+							if pairs.include?(o['pair']) && o['T'] == 'sell'
+								orders_by_pair[o['pair']] ||= []
+								orders_by_pair[o['pair']].push o
+							elsif based_pairs.include?(o['pair']) && o['T'] == 'buy'
+								orders_by_pair[o['pair']] ||= []
+								orders_by_pair[o['pair']].push o
+							end
+						}
+						orders_by_pair.each { |pair, orders|
+							cancel_ct += orders.size
 							ret = cancel_orders(pair, orders, allow_fail: true)
 							if ret.nil?
 								puts "Failed in canceling #{from_mkt} #{pair} orders, hope this does not affect".red
 							end
-						end
-					}
-				else
-					# Fetch all orders, filter by pairs
-					orders = active_orders(nil)
-					orders_by_pair = {}
-					orders = orders.select { |o|
-						if pairs.include?(o['pair']) && o['T'] == 'sell'
-							orders_by_pair[o['pair']] ||= []
-							orders_by_pair[o['pair']].push o
-						elsif based_pairs.include?(o['pair']) && o['T'] == 'buy'
-							orders_by_pair[o['pair']] ||= []
-							orders_by_pair[o['pair']].push o
-						end
-					}
-					orders_by_pair.each { |pair, orders|
-						ret = cancel_orders(pair, orders, allow_fail: true)
-						if ret.nil?
-							puts "Failed in canceling #{from_mkt} #{pair} orders, hope this does not affect".red
-						end
-					}
-				end
-				puts "Executed command: #{command}"
+						}
+					end
+					if cancel_ct == 0
+						puts "No order canceled, good to go"
+						break
+					end
+					cost_s = (Time.now - start_t)
+					if cost_s > pause_t - 15
+						puts "Abort canceling alive orders, seems not enough time. cost #{cost_s}, pause_t #{pause_t}"
+						break
+					else
+						puts "Retry canceling any alive orders again, still have time. cost #{cost_s}, pause_t #{pause_t}"
+					end
+				}
+				puts "The command executed is: #{command}"
 			end
 		end
 
@@ -4404,6 +4438,11 @@ module URN
 			all_assets.each { |asset|
 				margin_wallet_cash = @balance_cache.dig(asset, 'cash') || 0
 				margin_wallet_pnl = @balance_cache.dig(asset, 'pending') || 0
+				if market_name() == 'FTX' && margin_wallet_pnl > 0
+					margin_wallet_pnl = 0 # FTX lending balance is in PnL too
+				else
+					margin_wallet_pnl = @balance_cache.dig(asset, 'pending') || 0
+				end
 				margin_wallet_bal = margin_wallet_cash + margin_wallet_pnl
 				# For FTX, use USD * 10 as max of margin_wallet_bal
 				if market_name() == 'FTX' && asset == 'FTX_COLLATERAL'
@@ -4845,7 +4884,13 @@ module URN
 
 		include URN::CLI
     def run_cli(args=ARGV.clone)
-      return run_cli_int(ARGV) if args.size > 0
+      if args.size > 0
+				run_cli_int(ARGV)
+				return if args[0].downcase == 'wsskey' # Quit to print wsskey
+				get_input prompt:"Press ENTER for CLI mode"
+				ARGV.clear
+				return run_cli()
+			end
 			@_cli_mode = true
       # Interactive CLI mode if no args given
 			if oms_enabled?
@@ -6427,20 +6472,20 @@ module URN
 			bids ||= []
 			asks ||= []
 			# Speed up. round() -> 26.52%, (-) -> 9.60%
-			# precise = @price_precise || 10
-# 			bids.each { |o| o['p_take'] ||= (o['p']*(1-rate)).round(precise) }
-# 			asks.each { |o| o['p_take'] ||= (o['p']/(1-rate)).round(precise) }
-# 			bids.each { |o| o['p_make'] ||= (o['p']/(1-rate)).round(precise) }
-# 			asks.each { |o| o['p_make'] ||= (o['p']*(1-rate)).round(precise) }
+			# precise = @price_precise || 10 # (1-rate) could bring negative value
+# 			bids.each { |o| o['p_take'] ||= (o['p']/(1+rate)).round(precise) }
+# 			asks.each { |o| o['p_take'] ||= (o['p']*(1+rate)).round(precise) }
+# 			bids.each { |o| o['p_make'] ||= (o['p']*(1+rate)).round(precise) }
+# 			asks.each { |o| o['p_make'] ||= (o['p']/(1+rate)).round(precise) }
 
-			r = 1 - mkt_client.preprocess_deviation(pair, t:'taker/sell')
-			bids.each { |o| o['p_take'] ||= o['p']*r }
-			r = 1 - mkt_client.preprocess_deviation(pair, t:'taker/buy')
-			asks.each { |o| o['p_take'] ||= o['p']/r }
-			r = 1 - mkt_client.preprocess_deviation(pair, t:'maker/buy')
-			bids.each { |o| o['p_make'] ||= o['p']/r }
-			r = 1 - mkt_client.preprocess_deviation(pair, t:'maker/sell')
-			asks.each { |o| o['p_make'] ||= o['p']*r }
+			r = 1 + mkt_client.preprocess_deviation(pair, t:'taker/sell')
+			bids.each { |o| o['p_take'] ||= o['p']/r }
+			r = 1 + mkt_client.preprocess_deviation(pair, t:'taker/buy')
+			asks.each { |o| o['p_take'] ||= o['p']*r }
+			r = 1 + mkt_client.preprocess_deviation(pair, t:'maker/buy')
+			bids.each { |o| o['p_make'] ||= o['p']*r }
+			r = 1 + mkt_client.preprocess_deviation(pair, t:'maker/sell')
+			asks.each { |o| o['p_make'] ||= o['p']/r }
 			orderbook
 		end
 
