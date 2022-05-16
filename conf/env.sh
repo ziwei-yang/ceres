@@ -26,7 +26,7 @@ export FTX_API_DOMAIN='https://ftx.com'
 export OKEX_API_DOMAIN='https://www.okex.com/api'
 
 export URANUS_WITHDRAW_MARKETS='COINBASE,BINANCE,BITTREX,HITBTC,HUOBI,BFX,OKEX,POLO,KRAKEN,FTX'
-export URANUS_DEPOSIT_MARKETS="$URANUS_WITHDRAW_MARKETS",BITMEX,BITSTAMP
+export URANUS_DEPOSIT_MARKETS="$URANUS_WITHDRAW_MARKETS",BITMEX,BITSTAMP,GEMINI
 
 export ZB_API_DOMAIN_MATKET='https://api.zb.com/data'
 export ZB_API_DOMAIN_TRADE='https://trade.zb.com/api'
@@ -198,7 +198,7 @@ elif [[ $OS == 'Darwin' ]]; then
 	export URANUS_RAMDISK=$ramdisk
 fi
 
-function uranus_archive_old_logs {
+function _uranus_archive_old_logs_int {
 	for log in $1*.log ; do
 		[ ! -f $log ] && continue
 		basename=$( basename "$log" )
@@ -220,7 +220,8 @@ function uranus_archive_old_logs {
 				break
 			fi
 		done
-		ls -ahl  "$log"
+		[ ! -f $log ] && echo "$log is gone ????" && continue
+		ls -ahl "$log"
 		ramdisk_avail=0
 		[ ! -z $URANUS_RAMDISK ] && ramdisk_avail=$( df | grep RAMDisk | awk '{ print $4 }' )
 		if [ $ramdisk_avail -lt 300000 ]; then # If ramdisk available less than 300MB
@@ -245,6 +246,11 @@ function uranus_archive_old_logs {
 		echo "Failed, press enter to continue"
 		read
 	done
+}
+
+# Archive logs under old default dir. in background by default.
+function uranus_archive_old_logs {
+	_uranus_archive_old_logs_int $@ &
 }
 export HOSTNAME # For sending email
 

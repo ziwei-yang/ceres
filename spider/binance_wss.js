@@ -21,6 +21,7 @@ for (var i in pairsName) {
 	// Dirty tricks to broadcast BUSD market data in USD channel.
 	if (p[0] == 'BUSD') {
 		pairsMap[(p[1] + p[0]).toLowerCase()] = 'USD-' + p[1].toUpperCase();
+		pairsName[i] = 'USD-' + p[1].toUpperCase();
 	} else {
 		pairsMap[(p[1] + p[0]).toLowerCase()] = pairsName[i].toUpperCase();
 	}
@@ -73,6 +74,12 @@ function handleDepthData(market, data) {
 
 function handleDepthUpdateData(market, data) {
 	var ts = data.E;
+	var marketTime = ts;
+	if (marketTime != null && (Date.now() - marketTime) > 10*1000) {
+		log("Restart: too much latency", (Date.now() - marketTime), "ms")
+		process.exit(-1);
+	}
+
 	if (orderbookBids[market] == null || orderbookAsks[market] == null)
 		return;
 	lastValidDepthMsgTime[market] = Date.now();
@@ -83,12 +90,12 @@ function handleDepthUpdateData(market, data) {
 	for (var i in bidsUpdate) {
 		var p = parseFloat(bidsUpdate[i][0]);
 		var s = parseFloat(bidsUpdate[i][1]);
-		util.binaryUpdateBids(bids, p, s);
+		util.binaryUpdateBids(bids, p, s, maxMemory);
 	}
 	for (var i in asksUpdate) {
 		var p = parseFloat(asksUpdate[i][0]);
 		var s = parseFloat(asksUpdate[i][1]);
-		util.binaryUpdateAsks(asks, p, s);
+		util.binaryUpdateAsks(asks, p, s, maxMemory);
 	}
 	var result = cgui.markUpdate(market, {
 		'orderbookBids'	:	bids,

@@ -146,12 +146,16 @@ module URN
 
 			# For refreshing orderbooks, would be overwrited in service mode.
 			@market_snapshot = {}
+			# Any data updated after last refresh_orderbooks(), reset in refresh_orderbooks()
+			@market_snapshot_chg = Concurrent::Hash.new
 			@market_latest_trades = {}
 
 			# Listen from redis
 			@redis_sub_channels = {}
 			@redis_tick_buffer = {}
 			@redis_tick_chg = false
+
+			@abandon_large_latency_data = opt[:max_latency] || -1 # give up data when latency > ?? ms
 
 			# :dryrun :live :service
 			@mode = opt[:mode] || :dryrun
@@ -178,7 +182,7 @@ module URN
 				)
 				@redis_sub_channels["URANUS:#{odbk_m}:#{p}:full_odbk_channel"] = @redis_sub_channels["URANUS:#{odbk_m}:#{p}:full_odbk_channel"].uniq
 
-				if opt[:odbk_only] != true # Listen orderbook only if set true
+				if opt[:with_trades] == true # Also listen trades if set true
 					@redis_sub_channels["URANUS:#{odbk_m}:#{p}:full_tick_channel"] ||= []
 					@redis_sub_channels["URANUS:#{odbk_m}:#{p}:full_tick_channel"].push(
 						[m, p, :tick, mkt_given_name]
@@ -245,13 +249,19 @@ module URN
 			Thread.current.priority = 1
 			Thread.current[:name] = "DataSource #{@market_pairs.to_json[0..39]}"
 			puts "Subscribing #{JSON.pretty_generate(@redis_sub_channels.keys)}".green
+			return if @redis_sub_channels.empty?
 			@msg_t = nil
-			redis.subscribe(*(@redis_sub_channels.keys)) do |on|
+			redis.subscribe(*(@redis_sub_channels.keys)) { |on|
 				on.subscribe { |chn, num|
 					puts "Subscribed to #{chn} (#{num} subscriptions)" if @market_pairs.size < 5
 				}
-				on.message do |chn, msg| # TODO check if channel is orderbook or tick.
+				msg_ct = 0
+				slow_msg_ct = 0
+				giveup_notify_time = 0
+				on.message { |chn, msg|
+					msg_ct += 1
 					start_t = Time.now.to_f
+					start_ms = start_t * 1000
 					data_mkt_t, data_t = 0, 0
 					data_type = nil
 					msg_interval_t = (@msg_t.nil? ? 0 : (start_t - @msg_t)).round(3)
@@ -262,16 +272,57 @@ module URN
           puts msg if @verbose
 					# Parse data, msg should contains all data.
 					msg = parse_json(msg)
+					parse_ms = Time.now.to_f * 1000 - start_ms # 0.0X ms
 
 					changed_odbk, new_mkt_trades = nil, nil
 					changed_mp = [] # Might be mapping to different mp
+					msg_giveup = false
 					@redis_sub_channels[chn].each { |mptn|
 						m, p, type, mkt_given_name = mptn
 						mp = [m, p]
 
 						# Too much time cost here would lead data updates falling behind
 						begin
+							# If latency is high and msg keep piling up.
+							if msg_interval_t <= 0.1 && @abandon_large_latency_data > 0
+								latency = 0
+								if type == :odbk
+									bids, asks, t, mkt_t = msg
+									latency = start_ms-t
+								elsif type == :tick
+									trades, t = msg
+									latency = start_ms-t
+								end
+								if latency >= @abandon_large_latency_data
+									slow_msg_ct += 1
+									ratio = slow_msg_ct.to_f/msg_ct
+									# print everytime would cause severe latency, do it wisely.
+									if ratio > 0.1 && start_t - giveup_notify_time > 5
+										puts "Slow channel msg #{slow_msg_ct} #{(ratio*100).round(2)}% latency #{latency.round} > #{@abandon_large_latency_data}ms"
+										giveup_notify_time = start_t
+									end
+									if msg_ct >= 100_000 #RESET count
+										msg_ct == 0
+										slow_msg_ct == 0
+									end
+									# Only giveup orderbook message.
+									if type == :odbk
+										msg_giveup = true
+										# clear data that has high latency.
+										# Mark snapshot data as empty, not usable. Don't mark as nil, might cause null pointer somewhere.
+										@market_snapshot[mkt_given_name || m] ||= Concurrent::Hash.new
+										@market_snapshot[mkt_given_name || m][:orderbook] = [[], [], 0, 0]
+										@market_snapshot[mkt_given_name || m][p] ||= Concurrent::Hash.new
+										@market_snapshot[mkt_given_name || m][p][:orderbook] = [[], [], 0, 0]
+										# Also mark market_snapshot_chg, remeber to clear data in refresh_orderbooks()
+										@market_snapshot_chg[[mkt_given_name || m, p]] = true
+										break # Stop any processing about this msg.
+									end
+								end
+							end
+
 							if type == :odbk
+								# @market_snapshot[mkt_given_name][:orderbook] and @market_snapshot[mkt_given_name][p][:orderbook] would be updated.
 								data_chg = @parser.refresh_orderbooks(
 									[@market_client_map[mkt_given_name || m]],
 									[p],
@@ -281,6 +332,7 @@ module URN
 								)
 								next unless data_chg
 								changed_odbk = @market_snapshot[mkt_given_name || m][:orderbook]
+								@market_snapshot_chg[[mkt_given_name || m, p]] = true
 								changed_mp.push(mp)
 								bids, asks, t, mkt_t = changed_odbk
 								data_mkt_t = mkt_t
@@ -309,6 +361,7 @@ module URN
 					}
 
 					return if @_should_exit
+					next if msg_giveup
 					if @mode == :service
 						@service_monitor_threads.each { |thread| thread.wakeup }
 						next
@@ -350,9 +403,9 @@ module URN
 					else
 						puts "#{@_stat_line.join(' ')} ", nohead:true, inline:true, nofile:true
 					end
-				end
+				}
 				on.unsubscribe { |chn, num| raise "Unsubscribed to ##{chn} (#{num} subscriptions)" }
-			end
+			}
 		end
 
 		# Start in main thread mode, it keep driving data events.
@@ -500,9 +553,14 @@ module URN
 		def refresh_orderbooks(mkt_clients, pair_list, snapshot, opt={})
 			data_by_mp = (opt[:data_by_mp] == true)
 			@_valid_warning ||= {}
-			data_chg_mp = []
-			now = (Time.now.to_f*1000).to_i
-			mkt_clients.zip(opt[:order_pairs] || pair_list).each { |client, pair|
+			start_ms = Time.now.to_f * 1000
+			now = start_ms.to_i
+			pair_ct = 0
+			cp_list = mkt_clients.zip(opt[:order_pairs] || pair_list)
+			ttl_pair_ct = cp_list.size
+			# parsing_lmd will be applied on cp_list
+			parsing_lmd = lambda { |d|
+				client, pair = d
 				raise "Pair is null" if pair.nil?
 				m = client.given_name()
 				mkt_name = client.market_name()
@@ -511,14 +569,22 @@ module URN
 				else
 					snapshot[m] ||= {}
 				end
+				# only re-calculate data those updated
+				if @market_snapshot_chg[[m, pair]] == true
+					@market_snapshot_chg[[m, pair]] = false # reset updated flag, delete() might cause free() error
+				else
+					next
+				end
 				# odbk = @market_snapshot.dig(m, :orderbook).clone # snapshot keeps changing
 				odbk = @market_snapshot.dig(m, pair, :orderbook).clone # snapshot keeps changing
 				next if odbk.nil?
+				bids, asks, t, mkt_t = odbk
+				next if bids.empty? && asks.empty? && t == 0 && mkt_t == 0 # Marked as unusable because of latency
+				pair_ct += 1
 				if opt[:max_depth] != nil # Filter top depth odbk.
 					max_depth = opt[:max_depth]
-					bids, asks, t, mkt_t = odbk
-					bids = bids[0..max_depth]
-					asks = asks[0..max_depth]
+					bids = bids[0..(max_depth-1)]
+					asks = asks[0..(max_depth-1)]
 					odbk = [bids, asks, t, mkt_t]
 				end
 				# Add real price with commission to each order
@@ -542,7 +608,7 @@ module URN
 					old_odbk = snapshot[m][:orderbook]
 					snapshot[m][:orderbook] = odbk
 				end
-				next (data_chg_mp.push([m, pair])) if old_odbk.nil?
+				next [m, pair] if old_odbk.nil?
 				next if old_odbk == odbk
 				bids, asks, t, mkt_t = odbk
 				# Abort if timestamp is too old compared to system timestamp.
@@ -559,14 +625,23 @@ module URN
 					next
 				end
 				# Check market timestamp with latest market_client timestamp.
-				time_legacy = client.last_operation_time.strftime('%Q').to_i - t
+				time_legacy = client.last_operation_time.to_i - t
 				if time_legacy >= 0
 					m = client.market_name()
-					puts "#{m} orderbook is #{time_legacy}ms old"
+					puts "#{m} #{pair} orderbook is #{time_legacy}ms old"
 					next
 				end
-				data_chg_mp.push([m, pair])
-      }
+				next [m, pair]
+			}
+			# Parallel map can not boost up speed here, may also cause snapshot concurrent problems.
+			# data_chg_mp = Parallel.map(cp_list, in_threads: 3, &parsing_lmd).select { |r| r != nil }
+			data_chg_mp = cp_list.map(&parsing_lmd).select { |r| r != nil }
+			end_ms = Time.now.to_f * 1000
+			cost_ms = end_ms - start_ms
+			if (cost_ms >=3 || pair_ct >= 5) && cost_ms*15 >= pair_ct # Expect 0.02~0.06 ms for 1 pair
+				avg_t = (cost_ms/pair_ct).round(3)
+				puts "#{cost_ms.round(3)} ms cost in parsing #{pair_ct}/#{ttl_pair_ct} pairs odbk, avg_t #{avg_t}"
+			end
 			data_chg_mp
 		end
 		def refresh_trades(mkt_clients, pair_list, snapshot, opt={})

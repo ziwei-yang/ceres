@@ -129,7 +129,9 @@ module URN
 
 		def price_step(pair)
 			pair = get_active_pair(pair)
-			return pair_detail(pair)[:price_step] || raise("Not implement #{pair}")
+			ret = pair_detail(pair)[:price_step] || raise("Not implement #{pair}")
+			ret = 0.00001 if pair == 'USD-SLP' && ret == 0.0001 # Hard fix
+			return ret
 		end
 
 		def pair_detail(pair, opt={})
@@ -369,7 +371,16 @@ module URN
 					puts ">> #{order['i']} #{order['client_oid']}, skip OMS bc no pair"
 					oms_missed = true
 					res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
-					res = res[0] if res.is_a?(Array) && res.size == 1
+					# rare that res has more than one record, but all dup data.
+					if res.is_a?(Array) && res.size == 1
+						res = res[0]
+					elsif res.is_a?(Array) && res.size > 1
+						if res.uniq.size == 1
+							res = res.uniq.first
+						else
+							raise "More than one record in #{res.to_json}"
+						end
+					end
 					json = res
 				else
 					order['pair']	= pair
@@ -386,12 +397,30 @@ module URN
 						if opt[:just_placed]
 							json = _async_operate_order(pair, order['client_oid'] || order['i'], :query_new) {
 								res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
-								res = res[0] if res.is_a?(Array) && res.size == 1
+								# rare that res has more than one record, but all dup data.
+								if res.is_a?(Array) && res.size == 1
+									res = res[0]
+								elsif res.is_a?(Array) && res.size > 1
+									if res.uniq.size == 1
+										res = res.uniq.first
+									else
+										raise "More than one record in #{res.to_json}"
+									end
+								end
 								res
 							}
 						else
 							res = gemini_req '/v1/order/status', args: args, allow_fail:opt[:allow_fail], silent:opt[:silent]
-							res = res[0] if res.is_a?(Array) && res.size == 1
+							# rare that res has more than one record, but all dup data.
+							if res.is_a?(Array) && res.size == 1
+								res = res[0]
+							elsif res.is_a?(Array) && res.size > 1
+								if res.uniq.size == 1
+									res = res.uniq.first
+								else
+									raise "More than one record in #{res.to_json}"
+								end
+							end
 							json = res
 						end
 					end
@@ -422,26 +451,37 @@ module URN
 		def cancel_order(pair, order, opt={})
 			pre_cancel_order(order)
 			args = { :order_id => order['i'] }
+			trade = nil
 			begin
 				json = _async_operate_order(pair, order['i'], :cancel) {
 					gemini_req '/v1/order/cancel', args: args, allow_fail:opt[:allow_fail], cancel_order:true
 				}
 				return nil if json.nil? && opt[:allow_fail] == true
 			rescue OrderNotExist => e
-				if order['t'] != nil && order_age(order) <= 20_000 # Longest latency seen: 10s
-					puts "order is pretty new < 20 seconds, treat this as an error"
-					return nil if opt[:allow_fail] == true
-					puts "Retry after 3 seconds"
-					keep_sleep 3
-					retry
+				puts "Order not exist during cancelling, might be cache latency or cancelled".red
+				trade = query_order(pair, order, opt)
+				return nil if trade.nil? && opt[:allow_fail] == true # Failed in querying.
+				if order_alive?(trade) == false
+					puts "Order is not alive already"
+				else
+					puts "Order shows alive still, should because of latency."
+					if order['t'] != nil && order_age(order) <= 180_000 # Longest latency seen: 91s
+						puts "order is pretty new < 180 seconds, treat this as an cache latency error"
+						return nil if opt[:allow_fail] == true
+						puts "Retry after 3 seconds"
+						keep_sleep 3
+						retry
+					end
+					raise e
 				end
-				raise e
 			end
 			record_operation_time
 
 			# In case of buffer latency. Wait OMS for longer time.
-			trade = oms_wait_trade(pair, order['i'], 5, :cancel, force_update:order)
-			return nil if trade.nil? && opt[:allow_fail] == true
+			if trade.nil? || order_alive(trade)
+				trade = oms_wait_trade(pair, order['i'], 5, :cancel, force_update:order)
+				return nil if trade.nil? && opt[:allow_fail] == true
+			end
 
 			if order_alive?(trade)
 				puts "Order is still alive"
@@ -550,6 +590,7 @@ module URN
 			'BCH' => 'bitcoincash',
 			'LTC' => 'litecoin',
 			'ZEC' => 'zcash',
+			'DOGE' => 'doge',
 			'FIL' => 'filecoin'
 		}
 		def deposit_addr(asset, opt={})
@@ -636,8 +677,10 @@ module URN
 		end
 
 		def market_summary(pair, opt={})
-			res = redis_cached_call('candles_1day_'+pair, 60) {
-				gemini_req "/v2/candles/#{gemini_symbol(pair)}/1day", public:true, allow_fail: opt[:allow_fail]
+			opt = opt.clone
+			opt[:public] = true
+			res = redis_cached_call('candles_1day_'+pair, 600) {
+				gemini_req "/v2/candles/#{gemini_symbol(pair)}/1day", opt
 			}
 			return if res.nil? && opt[:allow_fail] == true
 			d = res.sort_by { |r| r[0] }.last
@@ -697,9 +740,6 @@ module URN
 			pair
 		end
 		def underlying_pair_to_pair(pair) # Dirty tricks to mapping trading pair -> pair
-			if ['USD-STORJ', 'USD-CVC'].include?(pair)
-				pair = pair.gsub('USD', 'USDT')
-			end
 			pair
 		end
 
@@ -884,10 +924,8 @@ module URN
 			original_path = path
 			loop do
 				path = original_path
-				if opt[:place_order] == true || opt[:cancel_order] == true
-					return nil if opt[:allow_fail] == true && is_banned?()
-					wait_if_banned()
-				end
+				return nil if opt[:allow_fail] == true && is_banned?()
+				wait_if_banned() unless opt[:wss_key] == true
 
 				now = Time.now
 				payload = {}
@@ -925,6 +963,7 @@ module URN
 				memo = "#{path} #{opt[:memo] || display_args_str} #{emergency_call ? "EMG".red : ""}"
 				loop {
 					break if opt[:skip_api_rate_control] == true
+					break if opt[:public] == true
 					should_call = api_rate_control(1, emergency_call, memo, opt)
 					break if should_call
 					if should_call == false && opt[:allow_fail] == true

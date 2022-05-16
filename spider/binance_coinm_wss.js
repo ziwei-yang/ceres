@@ -145,12 +145,12 @@ function handleDepthUpdateData(market, data) {
 	for (var i in bidsUpdate) {
 		var p = parseFloat(bidsUpdate[i][0]);
 		var s = parseFloat(bidsUpdate[i][1]);
-		util.binaryUpdateBids(bids, p, s);
+		util.binaryUpdateBids(bids, p, s, maxMemory);
 	}
 	for (var i in asksUpdate) {
 		var p = parseFloat(asksUpdate[i][0]);
 		var s = parseFloat(asksUpdate[i][1]);
-		util.binaryUpdateAsks(asks, p, s);
+		util.binaryUpdateAsks(asks, p, s, maxMemory);
 	}
 	var result = cgui.markUpdate(market, {
 		'orderbookBids'	:	bids,

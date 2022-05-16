@@ -58,6 +58,9 @@ elif [[ $1 == 'bybit' ]]; then
 elif [[ $1 == 'bybitu' ]]; then
 	export uranus_spider_exchange=BybitU
 	spider=spider/bybit_wss.js
+elif [[ $1 == 'bybitu'* ]]; then # bybitu1 bybitu2 ...
+	export uranus_spider_exchange=BybitU
+	spider=spider/bybit_wss.js
 elif [[ $1 == 'bybits' ]]; then
 	spider=spider/bybitspot_v2_wss.js
 elif [[ $1 == 'gemini' ]]; then
@@ -88,17 +91,11 @@ else
 	exit 1
 fi
 
+unset dynamic_market
 if [ -z $2 ] ; then
+	dynamic_market=$1
 	# echo "Markets should be provided in arguments." && exit 1
-	echo "No args, parse tmux_uranus.sh to get default spider args"
-	line=$( grep " $1 " $DIR/bin/tmux_uranus.sh | grep spider.sh )
-	echo -e "Match line:\n$line"
-	[[ -z $line ]] && echo "No match line" && exit
-	# Only get content between first and second quotes, then
-	# Remove first 2 columns: $DIR/spider.sh market_name
-	line=$( echo $line | awk -F '"' '{ print $2 }' | awk '{$1="";$2="";print }' | xargs )
-	echo -e "Target args:\n$line"
-	node_args=$line
+	echo "No args, parse tmux_uranus.sh to get default spider args $1"
 	# For auto task in tmux_uranus.sh,
 	# set URANUS_SPIDER_ODBK_MAX for less CPU usage
 	if [[ $1 == 'bybit'* || $1 == 'bncm'* || $1 == 'bnum'* ]]; then
@@ -121,6 +118,16 @@ nvm use $NODE_VER
 function loop_work {
 	while true ; do
 		cd $DIR
+		if [ ! -z $dynamic_market ] ; then # Reload task every time.
+			line=$( grep " $dynamic_market " $DIR/bin/tmux_uranus.sh | grep spider.sh )
+			echo -e "Match line:\n$line"
+			[[ -z $line ]] && echo "No match line" && exit
+			# Only get content between first and second quotes, then
+			# Remove first 2 columns: $DIR/spider.sh market_name
+			line=$( echo $line | awk -F '"' '{ print $2 }' | awk '{$1="";$2="";print }' | xargs )
+			echo -e "Target args:\n$line"
+			node_args=$line
+		fi
 		[[ ! -z $pre_cmd ]] && echo $pre_cmd && eval $pre_cmd
 		# Only in viewer mode, trap INT signal then do loop work again.
 		[[ $mode == 'viewer' ]] && echo "Set trap INT" && trap interrupted INT
@@ -142,7 +149,7 @@ function loop_work {
 		)
 		echo "Spider is terminated, restart soon"
 		trap - INT # Allow user to exit here
-		sleep 1
+		sleep 6 # Some exchanges might ban too many reconnections.
 	done
 }
 

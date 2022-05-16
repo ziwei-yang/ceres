@@ -1,5 +1,5 @@
 # ceres
-a piece of uranus
+a piece of uranus, part of market data collection/relay and cross exchange trading system.
 
 ## Dependency
 Make sure https://github.com/ziwei-yang/aphrodite in the same parent directory.
@@ -10,11 +10,15 @@ Proj/ceres
 
 ## Preparation:
 ```
-rvm install 2.6
+For market clients:
+rvm install 3.0.0
 bundle install
+
+For market crawlers:
+npm install -d
 ```
 
-## Data:
+## Backtesting Data:
 ```
 Proj/ceres/data/
 └── subscribe

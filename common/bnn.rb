@@ -66,7 +66,7 @@ module URN
 				}
 
 				args[:timestamp] = (Time.now.to_f*1000).to_i
-				args[:recvWindow] = 20*1000
+				args[:recvWindow] = 60*1000 # more time tolerance.
 	
 				args_str = args.to_a.
 					sort_by { |kv| kv[0] }.
@@ -127,6 +127,15 @@ module URN
 							if response['code'].is_a?(Integer) && response['code'] < 0
 								# http_pool error would not raise a http error.
 								raise BinanceError.new(response.to_json)
+							elsif response['success'].nil? && response['msg'] != nil &&
+									response['msg'] =~ /^Unknown error/
+								# Unknown error, please check your request or try again later.
+								puts response.to_s.red
+								return nil if opt[:allow_fail] == true
+								raise OrderMightBePlaced.new if opt[:place_order] == true
+								puts "Try again after 3s"
+								keep_sleep 3
+								next
 							elsif response['success'] == false &&
 									response['msg'] == 'System abnormality'
 								now = DateTime.now
@@ -316,11 +325,17 @@ module URN
 						elsif err_res.include?('"code":-2013,')
 							puts "Order does not exist."
 							raise OrderNotExist.new(err_res)
+						elsif err_res.include?('"code":-2022,')
+							puts "ReduceOnly Order is rejected."
+							raise NotEnoughBalance.new(err_res)
 						elsif err_res.include?('"code":-3020,')
 							puts "Balance is not enough"
 							raise NotEnoughBalance.new(err_res)
 						elsif err_res.include?('"code":-3041,')
 							puts "Balance is not enough"
+							raise NotEnoughBalance.new(err_res)
+						elsif err_res.include?('"code":-3045,') # Borrow
+							puts "The system does not have enough asset now"
 							raise NotEnoughBalance.new(err_res)
 						elsif err_res.include?('"code":-4093,')
 							puts "The deposit has been closed"
@@ -334,6 +349,11 @@ module URN
 						elsif err_res.include?('"code":-11015,')
 							puts "Balance is not enough"
 							raise NotEnoughBalance.new(err_res)
+						elsif err_res.include?('Unknown error, please check your request or try again later.')
+							raise OrderMightBePlaced.new if opt[:place_order] == true
+							return nil if opt[:allow_fail] == true # No code in this case
+							keep_sleep 1
+							next
 						end
 						raise e
 					end
@@ -484,16 +504,25 @@ module URN
 			elsif URN::USD_TOKENS.include?(asset)
 				usdt_fee = withdraw_fee('USDT')
 				if usdt_fee > 20
-					return (usdt_fee.to_f/10000).ceil(3)
+					return (usdt_fee.to_f/20000).ceil(3)
 				end
 				return nil
 			elsif URN::ETH_TOKENS.include?(asset)
 				# Also depends on volume of USDT-ASSET / BTC-ASSET ?
 				usdt_fee = withdraw_fee('USDT')
+				r = nil
 				if usdt_fee > 20
-					return (usdt_fee.to_f/5000).ceil(3)
+					r = (usdt_fee.to_f/20000).ceil(3)
 				end
-				return nil
+				# Some typical high fee assets.
+				if ['AAVE', 'DNT', 'CVC', 'BAT', 'COMP', 'STORJ', 'ZRX'].include?(asset)
+					if r.nil?
+						r = 1/250.0
+					else
+						r *= 2
+					end
+				end
+				return r
 				# ETH withdraw_fee should mul to its price, use USDT fee instead.
 			end
 			return 0.005 if HIGH_FEE_ASSETS.include?(asset)
@@ -509,6 +538,7 @@ module URN
 				symbol = r['symbol']
 				[pair, symbol]
 			end.to_h
+			res.delete('USD-XEM') # Delisted but not in API.
 			res
 		end
 
@@ -573,7 +603,7 @@ module URN
 					info_found = true
 				}
 				next if is_fiat
-				puts "No withdraw/deposit info for #{asset} #{JSON.pretty_generate(asset_info)}" if info_found != true
+				# puts "No withdraw/deposit info for #{asset} #{JSON.pretty_generate(asset_info)}" if @verbose && info_found != true
 			}
 			@binance_fee_map = fee_map
 			@can_deposit_map = can_deposit_map
@@ -1159,7 +1189,7 @@ module URN
 		end
 
 		def withdraw(asset, amount, address, opt={})
-			amount = amount.round(6)
+			amount = amount.round(8)
 			asset = asset.upcase
 
 			# If amount is less than balance_cache but bank_balance has more,
@@ -1297,7 +1327,48 @@ module URN
 			list
 		end
 
+		def market_summaries(opt={})
+			res = redis_cached_call("market_summaries", 600) {
+				binance_req '/api/v3/ticker/24hr', public:true, allow_fail: true, weight: 40
+			}
+			return nil if res.nil? && opt[:allow_fail] == true
+			binance_symbol_info() if @binance_symbol_info.nil?
+			result = {}
+			res.each { |r|
+# 				"symbol": "GALTRY",
+# 				"priceChange": "-28.10000000",
+# 				"priceChangePercent": "-11.007",
+# 				"weightedAvgPrice": "233.93157544",
+# 				"prevClosePrice": "0.00000000",
+# 				"lastPrice": "227.20000000",
+# 				"lastQty": "4.38900000",
+# 				"bidPrice": "227.40000000",
+# 				"bidQty": "10.00000000",
+# 				"askPrice": "229.90000000",
+# 				"askQty": "6.53900000",
+# 				"openPrice": "255.30000000",
+# 				"highPrice": "269.00000000",
+# 				"lowPrice": "211.60000000",
+# 				"volume": "27063.83500000",
+# 				"quoteVolume": "6331085.55900000",
+# 				"openTime": 1651764577451,
+# 				"closeTime": 1651850977451,
+				pair = binance_standard_pair(r['symbol'])
+				result[pair] = {
+					'from'					=> r['openTime'].to_i,
+					'open'					=> r['openPrice'].to_f,
+					'last'					=> r['lastPrice'].to_f,
+					'high'					=> r['highPrice'].to_f,
+					'low'						=> r['lowPrice'].to_f,
+					'amt'						=> r['volume'].to_f,
+					'vol'						=> r['quoteVolume'].to_f
+				}
+			}
+			return result
+		end
+
 		def market_summary(pair, opt={})
+			pair = pair_to_underlying_pair(pair.upcase)
 			all_pairs(opt) if @binance_pair_symbol.nil?
 			return nil if @binance_pair_symbol[pair].nil?
 			args = {
@@ -1305,11 +1376,17 @@ module URN
 				:interval	=> '1d',
 				:symbol		=> binance_symbol(pair)
 			}
+			opt = opt.clone
+			opt[:public] = true
+			opt[:args] = args
+			opt[:weight] = 1
 			res = redis_cached_call("klines_#{pair}", 600) {
-				binance_req '/api/v3/klines', public:true, args:args, weight: 1
+				binance_req '/api/v3/klines', opt
 			}
+			return nil if res.nil? && opt[:allow_fail] == true
+			raise "Failed in getting klines" if res.nil?
 			# pair might be just listed, trading not started yet, duplicate candle.
-			res[1] = res[0] if res.size == 1
+			res[1] = res[0] if res != nil && res.size == 1
 			raise "Market summary size is #{res.size}: #{JSON.pretty_generate(res)}" unless res.size == 2
 			# time, open, high, low, close
 			{
@@ -1967,6 +2044,9 @@ module URN
 			begin
 				json = binance_req '/sapi/v1/margin/maxBorrowable', opt
 				return nil if opt[:allow_fail] == true && json.nil?
+			rescue NotEnoughBalance
+				puts "The system does not have enough asset now"
+				return 0
 			rescue ActionDisabled
 				puts "No cross margin available for #{asset}".red
 				return 0
@@ -2040,13 +2120,13 @@ module URN
 
 		def pair_to_underlying_pair(pair) # Dirty tricks to mapping pair -> trading pair
 			if pair =~ /^USD-/
-				pair = pair.gsub('USD', 'BUSD')
+				pair = "BUSD-#{pair.split('-')[1]}"
 			end
 			pair
 		end
 		def underlying_pair_to_pair(pair) # Dirty tricks to mapping trading pair -> pair
 			if pair =~ /^BUSD-/
-				pair = pair.gsub('BUSD', 'USD')
+				pair = "USD-#{pair.split('-')[1]}"
 			end
 			pair
 		end

@@ -156,8 +156,12 @@ module URN
 		def format_num(f, float=8, decimal=8)
 			return ''.ljust(decimal+float+1) if f.nil?
 			return ' '.ljust(decimal+float+1, ' ') if f == 0
-			return f.round.to_s.rjust(decimal+float+1, ' ') if float == 0
 			return f.rjust(decimal+float+1) if f.is_a? String
+			if float == 0
+				f = f.round
+				return ' '.ljust(decimal+float+1, ' ') if f == 0
+				return f.to_s.rjust(decimal+float+1, ' ')
+			end
 			num = f.to_f
 			f = "%.#{float}f" % f
 			loop do
@@ -542,6 +546,7 @@ module URN
 
 	# Fetch trader status from redis and conf files.
 	module TraderStatusUtil
+		include APD::LogicControl
 		include URN::OrderUtil
 		include URN::Misc
 		def redis
@@ -666,8 +671,27 @@ module URN
 			return Oj.load(content)
 		end
 
-		# Return pair list in /task/arbitrage_*
+		# Scan bin/tmux_uranus* for *active* managed arbi tasks.
 		def available_trading_pairs()
+			pairs = []
+			Dir["#{URN::ROOT}/bin/tmux_uranus*.sh"].each { |f|
+				File.read(f).split("\n").each { |l|
+					next if l.strip.empty?
+					l = l.strip.split('#')[0] # remove comment
+					next unless l.include?('/task/arbitrage_')
+					pair = l.split('/task/arbitrage_')[1].split('.sh')[0]
+					if pair.include?('_')
+						pair = pair.split('_').join('-').upcase
+					else
+						pair = "BTC-#{pair}".upcase
+					end
+					pairs.push(pair)
+				}
+			}
+			pairs
+		end
+		# Return pair list in /task/arbitrage_*
+		def available_trading_pairs_in_task_dir()
 			pairs = Dir["#{URN::ROOT}/task/arbitrage_*.sh"].map { |f|
 				p = File.basename(f).split('arbitrage_')[1].split('.sh')[0].upcase.gsub('_', '-')
 				p = "BTC-#{p}" unless p.include?('-')
@@ -710,21 +734,56 @@ module URN
 
 		def active_spider_tasks
 			file = "#{URN::ROOT}/bin/tmux_uranus.sh"
-			lines = File.read(file).split("\n").select { |l| l.include?('/spider.sh') }
+			lines = endless_retry(sleep: 5) {
+				File.read(file).split("\n").select { |l| l.include?('/spider.sh') }
+			}
 			result = {}
 			lines.each { |l|
 				args = l.split('spider.sh')[1].gsub('"', '').strip.upcase.split(' ')
 				market = args.shift
 				market = 'FTX' if market =~ /^FTX[0-9]*/ # FTX0-9 sub tasks -> FTX
+				market = 'BYBITU' if market =~ /^BYBITU[0-9]*/ # BYBITU0-9 sub tasks -> FTX
 				pairs = args.map { |a| (a.include?('-') ? a : "BTC-#{a}") }
 				pairs.each { |p|
 					result[p] ||= {}
 					result[p][market] = true
-					# Gemini also publish usd pairs data to usdt pairs
-					if market == 'GEMINI' && p =~ /^USD-/
-						usdt_p = p.gsub('USD-', 'USDT-')
-						result[usdt_p] ||= {}
-						result[usdt_p][market] = true
+					quote, asset = p.split('-')
+					if market == 'GEMINI'
+						if quote == 'USD'
+							# Gemini also publish usd pairs data to usdt pairs
+							alt_p = p.gsub('USD-', 'USDT-')
+							result[alt_p] ||= {}
+							result[alt_p][market] = true
+						end
+					elsif market == 'COINBASE'
+						if ['USDC-ADA', 'USDC-BAT', 'USDC-CVC', 'USDC-DNT', 'USDC-MANA', 'USDC-ZEC'].include?(p)
+							# Coinbase re-direct these pairs to USDT pairs
+							alt_p = p.gsub('USDC-', 'USDT-')
+							result[alt_p] ||= {}
+							result[alt_p][market] = true
+						end
+						if p == 'USDC'
+							# Coinbase uses USD pair as USDC
+							alt_p = p.gsub('USDC-', 'USD-')
+							result[alt_p] ||= {}
+							result[alt_p][market] = true
+							result[p].delete(market)
+						end
+					elsif market == 'BINANCE'
+						if quote == 'BUSD'
+							# Binance publish busd pairs data to usd pairs
+							alt_p = p.gsub('BUSD-', 'USD-')
+							result[alt_p] ||= {}
+							result[alt_p][market] = true
+							result[p].delete(market)
+						end
+					elsif market == 'FTX'
+						if ['USD-CVC', 'USD-STORJ'].include?(p)
+							# FTX re-direct these pairs to USDT pairs
+							alt_p = p.gsub('USD-', 'USDT-')
+							result[alt_p] ||= {}
+							result[alt_p][market] = true
+						end
 					end
 				}
 			}
@@ -745,17 +804,41 @@ module URN
 			raise "No BTC price." if btc_price.nil?
 			map = {}
 			# Merge and sort by market cap, evaluate rank again.
+			usd_mc_ttl, btc_mc_ttl, eth_mc_ttl, alt_mc_ttl = 0, 0, 0, 0
 			list.values.
 				sort_by { |d| d['market_cap'] }.
-				reverse.each_with_index do |d, i|
+				reverse.each_with_index { |d, i|
 					d['price_btc'] = d['price'].to_f/btc_price
 					d['price_sat'] = (d['price_btc'].to_f * 100000000).to_i
 					d['24h_volume_usd'] = d.delete('volume')
 					d['24h_volume_btc'] = (d['24h_volume_usd'].to_f/btc_price).to_i
 					d['rank'] = i+1
+					case d['name']
+					when 'BTC'
+						btc_mc_ttl += d['market_cap']
+					when 'ETH'
+						eth_mc_ttl += d['market_cap']
+					when /(UST|DAI|USD|PAXG|XAUT)/ # Any asset contains these.
+						usd_mc_ttl += d['market_cap']
+					when /(BTC|ETH|CRV)/ # Any asset contains BTC/ETH : aWBTC, cETH, CRVLP
+						;
+					else
+						alt_mc_ttl += d['market_cap']
+					end
 					map[d['name']] = d
-				end
+			}
+			@_coingecko_mc_stat = {
+				:usd_mc_ttl => usd_mc_ttl,
+				:btc_mc_ttl => btc_mc_ttl,
+				:eth_mc_ttl => eth_mc_ttl,
+				:alt_mc_ttl => alt_mc_ttl
+			}
 			map
+		end
+
+		def coingecko_mc_stat
+			coingecko_stat() if @_coingecko_mc_stat.nil?
+			return @_coingecko_mc_stat
 		end
 	
 		def coingecko_list(opt={})

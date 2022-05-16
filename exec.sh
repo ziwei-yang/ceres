@@ -3,6 +3,7 @@ SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 
 file=$1
+first_arg=$2
 [ -f $file ] || exit 1
 shift
 
@@ -10,7 +11,7 @@ source $DIR/conf/env.sh
 rvm use $RUBY_VER # Setup Ruby env.
 basename=$( basename $file )
 need_log=0
-echo $basename
+echo $basename $first_arg
 if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'print_xfr.rb' ] || \
 	[ $basename == 'print_algo.rb' ] || \
@@ -28,6 +29,9 @@ if [ $basename == 'print_legacy.rb' ] || \
 	[ $basename == 'ib.rb' ] || \
 	[ $basename == 'test.rb' ] || \
 	[ $basename == 't.rb' ] ; then
+	source $DIR/conf/dummy_env.sh
+	source $DIR/conf/env.sh
+elif [ $first_arg == 'rate' ] ; then # API monitor
 	source $DIR/conf/dummy_env.sh
 	source $DIR/conf/env.sh
 elif [ $basename == 'pos.rb' ] ; then

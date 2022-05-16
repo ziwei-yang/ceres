@@ -142,6 +142,13 @@ module URN
 			end
 		end
 
+		# For mkt oms_order_delete()
+		def self.oms_orders(mkt)
+			cache = @@oms_local_cache[mkt]
+			return [] if cache.nil?
+			return cache.values
+		end
+
 		# Could be run without start listening broadcast.
 		# Clear dead order with age older than 1 hour.
 		# Has bug with Future markets.
@@ -231,7 +238,7 @@ module URN
 		end
 
 		def self._listen_oms(channels, opt={})
-			pair_prefix = opt[:pair_prefix] || ''
+			@@pair_prefix = pair_prefix = opt[:pair_prefix] || ''
 			channels.each { |chn|
 				mkt = @@_oms_broadcast_channels[chn]
 				@@work_markets[mkt] = false

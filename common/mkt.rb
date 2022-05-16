@@ -85,19 +85,27 @@ module URN
         else
           raise "Not implemented"
         end
-			elsif market_type() == :spot
+			elsif !is_future?(pair)
+				if market_type() == :spot || @ftx_market_type_mixed
+					# expected
+				else
+					raise "Unexpected market - spot pair #{market_name()} #{pair} #{market_type()}"
+				end
 				# For spot market, keep balance 0.0001 by default
 				remain = 0.0001 # Default: always keep some balance.
-				left_ratio = 0.0 # Default: use up all balance.
+				remain = 0 if market_name() == 'Polo' # Ready to quit arb
+				remain = 0 if market_name() == 'HitBTC' # Ready to quit arb
+				remain = 0 if market_name() == 'OKEX' # Ready to quit arb
+
+				left_ratio = 0.0 # Default: use up all balance, some exchanges might deduct from cash asset.
 				if opt[:clear_bal] == true
 					remain = 0
 					if type == 'buy' && market_name() == 'HitBTC' && pair =~ /^USDT/
 						# HitBTC needs to keep some USDT for fee, and it is 0.1%, not maker/buy fee
 						left_ratio = 0.001
 					end
-				end
-				if ['buy', 'bid'].include?(type.strip.downcase) && market_name() == 'FTX' && asset1 == 'USD'
-					remain = 350_000 # To buy with USD, keep at least XXXK USD in FTX for futures margin.
+				elsif ['buy', 'bid'].include?(type.strip.downcase) && market_name() == 'FTX' && asset1 == 'USD'
+					remain = (URN::MKT_BEAR ? 1_000_000 : 300_000) # To buy with USD, keep at least XXXK USD in FTX for futures margin.
 				elsif ['buy', 'bid'].include?(type.strip.downcase) && market_name() == 'FTX' && asset1 == 'BTC'
 					remain = 30 # To buy with BTC, keep at least 30 BTC in FTX for futures margin.
 				elsif ['sell', 'ask'].include?(type.strip.downcase) && market_name() == 'FTX' && asset2 == 'BTC'
@@ -114,14 +122,15 @@ module URN
 			elsif market_type() == :future
 				; # Process this below.
 			else
-				raise "unknown market type #{market_type()}"
+				raise "Unexpected market - spot pair #{market_name()} #{pair} #{market_type()}"
 			end
 
 			########### Process for future markets ############
 			########### How much safe margin left ############
 			cash_asset = future_margin_asset(pair)
 			cash_in_asset1 = (cash_asset == asset1)
-			cash_in_asset1 = true if market_name == 'FTX' # FTX use FTX_COLLATERAL, is also kind of USD
+			cash_in_asset1 = true if market_name().start_with?('FTX') # use COLLATERAL, is also kind of USD
+			cash_in_asset1 = true if market_name().start_with?('BNUM') # use COLLATERAL, is also kind of USD
 
 			# Don't reduce cash by remain for futures.
 			# Position cost of each pair should not larger than future_max_position_cost()
@@ -181,7 +190,7 @@ module URN
 		def future_diversity_mul(pair=nil)
 			return 1 if quantity_in_orderbook() == :vol
 			# FTX does not need more mul, need to take care of USD balance
-			return 1 if market_name() == 'FTX'
+			return 1 if market_name().start_with?('FTX')
 
 			larger_5_pct_contracts = []
 			larger_10_pct_contracts = []
@@ -222,7 +231,7 @@ module URN
 			pair = get_active_pair(pair)
 
 			max_lev = nil
-			if market_name() == 'FTX'
+			if market_name().start_with?('FTX')
 				# FTX use FTX_COLLATERAL as margin but need to compute USD PnL buffer
 				usd_bal = @balance_cache.dig('USD', 'cash')
 				usd_bal += (@balance_cache.dig('USD', 'reserved') || 0)
@@ -248,7 +257,7 @@ module URN
 			pair = get_active_pair(pair)
 
 			max_lev = nil
-			if market_name() == 'FTX'
+			if market_name().start_with?('FTX')
 				# FTX use FTX_COLLATERAL as margin but need to compute USD PnL buffer
 				usd_bal = @balance_cache.dig('USD', 'cash')
 				usd_bal += (@balance_cache.dig('USD', 'reserved') || 0)
@@ -319,29 +328,12 @@ module URN
 			raise "Override this method"
 		end
 
-		# See future_margin_asset()
-# 		def future_collateral_asset(pair)
-# 			raise "For futures only #{pair}" unless is_future?(pair)
-# 			quote, asset, expiry = parse_contract(pair)
-# 			if market_name() == 'Bitmex' && pair.start_with?('BTC-')
-# 				return quote
-# 			elsif market_name() == 'FTX'
-# 				return 'FTX_COLLATERAL'
-# 			elsif ['Bybit'].include?(market_name()) && pair.start_with?('USDT-')
-# 				return quote
-# 			elsif ['BNUM', 'BybitU', 'BybitU_LHY'].include?(market_name()) && (pair.start_with?('USDT-') || pair.start_with?('BUSD-'))
-# 				return 'USDT'
-# 			elsif ['HBDM', 'Bybit', 'Bybit_LHY', 'BNCM', 'BNCM_Y'].include?(market_name()) && pair.start_with?('USD-')
-# 				return asset
-# 			else
-# 				raise "Not implemented for #{pair} in #{market_name()}"
-# 			end
-# 		end
-
 		def future_margin_asset(pair)
-			raise "For futures only #{pair}" unless is_future?(pair)
-			if market_name() == 'FTX'
+			raise "For futures only #{market_name()} #{pair}" unless is_future?(pair)
+			if market_name().start_with?('FTX')
 				return "FTX_COLLATERAL"
+			elsif market_name().start_with?('BNUM') && @_bnum_cross
+				return "BNUM_COLLATERAL"
 			elsif quantity_in_orderbook() == :vol # USD-BTC@P -> BTC
 				return pair.split('@')[0].split('-')[1]
 			else
@@ -364,7 +356,8 @@ module URN
 			asset1, asset2, expiry = parse_contract(pair)
 			cash_asset = future_margin_asset(pair)
 			cost_on_quote = (cash_asset == asset1) # quote-base contract use quote as margin asset.
-			cost_on_quote = true if market_name == 'FTX' # FTX use FTX_COLLATERAL, is also kind of USD
+			cost_on_quote = true if market_name().start_with?('FTX') # use COLLATERAL, is also kind of USD
+			cost_on_quote = true if market_name().start_with?('BNUM') # use COLLATERAL, is also kind of USD
 
 			# Available balance should deduct from pending buying orders.
 			cash_balance = (@balance_cache.dig(cash_asset, 'cash') || 0)
@@ -373,8 +366,10 @@ module URN
 			pair_cost, long_cost, short_cost = 0.0, 0.0, 0.0
 			@balance_cache.each { |contract, bal_map|
 				next unless is_future?(contract)
-				if market_name() == 'FTX'
+				if market_name().start_with?('FTX')
 					# All FTX contracts uses FTX_COLLATERAL
+				elsif market_name().start_with?('BNUM') && @_bnum_cross
+					# All BNUM contracts uses BNUM_COLLATERAL
 				elsif cost_on_quote == true
 					# example: Bybit all USDT contract shares USDT as margin.
 					next unless contract.start_with?("#{cash_asset}-")
@@ -877,26 +872,37 @@ module URN
 				market_balance_map[market] = market_balance
 			end
 			# Fetch realtime balance in parallel.
-			puts "Scanning balance..." if market_balance_map.values.include?(nil) && opt[:silent] != true
-			if parallel == false || market_balance_map.to_a.select { |mb| mb[1].nil? }.size <= 1
-				market_balance_map = market_balance_map.to_a.map do |mb|
+      scan_task_ct = market_balance_map.values.select { |v| v.nil? }.size
+			puts "Scanning balance..." if scan_task_ct > 0 && opt[:silent] != true
+			logs_by_m = Concurrent::Hash.new
+			ttl_query_t = Time.now.to_f
+			bal_query_lmd = lambda { |mb|
 					market, market_balance = mb
 					next mb unless market_balance.nil?
+					query_t = Time.now.to_f
 					market_balance = market_client(market).balance(verbose:false, allow_fail:true, silent:opt[:silent])
-					puts "#{market} balance got in serial." unless opt[:silent] == true
-					[market, market_balance]
-				end.to_h
+					query_t = (Time.now.to_f - query_t).round(3)
+					log = "#{market} balance got in #{query_t}"
+					logs_by_m[market] = log
+					puts log unless opt[:silent] == true
+					next [market, market_balance]
+			}
+			if parallel == false || scan_task_ct <= 1
+				market_balance_map = market_balance_map.to_a.map(&bal_query_lmd).to_h
 			else
-				market_balance_map = Parallel.map(market_balance_map.to_a) do |mb|
-					market, market_balance = mb
-					next mb unless market_balance.nil?
-					market_balance = market_client(market).balance(verbose:false, allow_fail:true, silent:opt[:silent])
-					puts "#{market} balance got in parallel." unless opt[:silent] == true
-					[market, market_balance]
-				end.to_h
+				market_balance_map = Parallel.map(market_balance_map.to_a, &bal_query_lmd).to_h
+				market_balance_map.each { |market, market_balance| # Write back to current thread.
+					next if market_balance.nil?
+					market_client(market).balance_cache_write(market_balance)
+				}
+			end
+			ttl_query_t = (Time.now.to_f - ttl_query_t).round(3)
+      if scan_task_ct > 0 && opt[:silent] != true
+				logs_by_m.each { |m, l| puts "#{m.ljust(8)} #{l}" }
+				puts "Total query time #{ttl_query_t}"
 			end
 			# Flush back to cache or load from cache if failure occurred.
-			market_balance_map.keys.each do |market|
+			market_balance_map.keys.each { |market|
 				market_balance = market_balance_map[market]
 				if market_balance.nil?
 					puts "Fail to load market balance: #{market}".red
@@ -914,7 +920,7 @@ module URN
 						redis.set "URANUS:#{market}:balance_snapshot", snapshot.to_json
 					}
 				end
-			end
+			}
 
 			balance_map = {}
 			balance = {}
@@ -966,7 +972,8 @@ module URN
 				:bal			=> balance,
 				:chg			=> changed,
 				:last_map	=> @last_balance_map,
-				:bal_map	=> balance_map
+				:bal_map	=> balance_map,
+				:log			=> logs_by_m
 			}
 			@last_balance_map = balance_map
 			@last_balance_total = balance
@@ -1473,13 +1480,15 @@ module URN
 			end
 			pub_channel = "URANUS:REQ:stat_channel"
 			# Only broadcast data when machine is in rack.
-			if ENV['IN_RACK'] == '1'
-				begin
-					pub_msg = [market_name(), url, time, display_args, err, proxy, @task_name].to_json
-				rescue # JSON encoding error:"\xE6" from ASCII-8BIT to UTF-8
-					pub_msg = [market_name(), url, time, display_args, err.class.to_s, proxy, @task_name].to_json
-				end
-				redis.publish(pub_channel, pub_msg)
+			if ENV['IN_RACK'] == '1' # async to save time.
+				URN.async(name: "mkt_req_post publish") {
+					begin
+						pub_msg = [market_name(), url, time, display_args, err, proxy, @task_name].to_json
+					rescue # JSON encoding error:"\xE6" from ASCII-8BIT to UTF-8
+						pub_msg = [market_name(), url, time, display_args, err.class.to_s, proxy, @task_name].to_json
+					end
+					redis.publish(pub_channel, pub_msg)
+				}
 			end
 		end
 
@@ -1762,14 +1771,16 @@ module URN
 			if opt[:broadcast].nil? || (opt[:broadcast] == true)
 				# Default: broadcast this
 				endless_retry(sleep:1) {
-					redis.set(key, value.to_json) # Set key-value
-					redis.publish(channel, value.to_json) # Notify other subscribers.
-					redis.publish(channel2, value.to_json) # Notify other subscribers, unify channel
+					redis.pipelined { |r_conn|
+						r_conn.set(key, value.to_json) # Set key-value
+						r_conn.publish(channel, value.to_json) # Notify other subscribers.
+						r_conn.publish(channel2, value.to_json) # Notify other subscribers, unify channel
+					}
 				}
-			else # Set locally.
-				URN::MktStatusListener.banned_util_set(market_name(), value)
-				@mkt_status_cache[:ban] = value
 			end
+			# Set locally.
+			URN::MktStatusListener.banned_util_set(market_name(), value)
+			@mkt_status_cache[:ban] = value
 		end
 
 		# Banned info needs to be clear in time.
@@ -1788,9 +1799,11 @@ module URN
 				'reason'	=> info
 			}
 			endless_retry(sleep:1) {
-				redis.del(key)
-				redis.publish(channel, value.to_json) # Notify other subscribers.
-				redis.publish(channel2, value.to_json) # Notify other subscribers, unify channel.
+				redis.pipelined { |r_conn|
+					r_conn.del(key)
+					r_conn.publish(channel, value.to_json) # Notify other subscribers.
+					r_conn.publish(channel2, value.to_json) # Notify other subscribers, unify channel.
+				}
 			}
 		end
 
@@ -2082,6 +2095,24 @@ module URN
 			endless_retry { redis.set(api_rate_data, data.to_json) }
 		end
 
+		# API throttled in short time.
+		def api_throttled?
+			return false if @_api_throttled.nil?
+			diff = Time.now.to_f - @_api_throttled
+			return true if diff < Random.rand(10) + 10
+			@_api_throttled = nil
+			return false
+		end
+
+		# API throttled in short time.
+		def api_order_throttled?
+			return false if @_api_order_throttled.nil?
+			diff = Time.now.to_f - @_api_order_throttled
+			return true if diff < Random.rand(10) + 10
+			@_api_order_throttled = nil
+			return false
+		end
+
 		# Common API rate control: API key index - 0, weight 1
 		def api_rate_control(weight, emergency_call, memo, opt={})
 			opt = opt.clone
@@ -2132,7 +2163,7 @@ module URN
 			order_limit = data.dig('rule', 'order')
 			emergency_order_quota = (0.1 * order_limit[0]).ceil
       if market_name() == 'Binance' # Use more harsh limit on Binance
-        emergency_order_quota = (0.2 * order_limit[0]).ceil
+        emergency_order_quota = (0.15 * order_limit[0]).ceil
       end
 
 			if emergency_call == true # Still keep some quota in case of competetion.
@@ -2151,7 +2182,7 @@ module URN
 				end
 			elsif opt[:order_priority] != nil && opt[:order_priority] <= 5
 				# Tight rules for low priority API req, <= 80%
-				emergency_order_quota = (emergency_order_quota * 1.5).ceil
+				emergency_order_quota = (emergency_order_quota * 2).ceil
 			end
 
 			now_ms = (Time.now.to_f * 1000).to_i
@@ -2196,8 +2227,13 @@ module URN
 					over_quota = current_weight_score - (weight_limit[0] - emergency_weight_quota)
 				end
 			end
-			# Bittrex only ban closed orders and public APIs.
+
+			############ Special rules for rate control #############
+			# Bittrex only ban closed orders and public APIs, low weight means no throttles.
 			could_call = true if market_name() == 'Bittrex' && weight <= 1
+			# 'Gemini throttle place_order and cancel_order only', this is wrong
+			# could_call = true if market_name() == 'Gemini' && opt[:place_order].nil? && opt[:cancel_order].nil?
+			############ Special rules for rate control #############
 
 			# Update score and prepare message.
 			if could_call
@@ -2206,6 +2242,16 @@ module URN
 			end
 			msg += " CALL #{could_call} => #{current_weight_score}"
 			msg += " NEWORDER" if opt[:place_order] == true
+
+			if could_call == false
+				if opt[:order_priority] != nil && opt[:order_priority] <= 5
+					;
+				elsif opt[:place_order] == true
+					@_api_order_throttled = Time.now.to_f # See api_throttled?()
+				else
+					@_api_throttled = Time.now.to_f # See api_order_throttled?()
+				end
+			end
 
 			# Overquota more -> update less.
 			update_on_failed = (Random.rand([20, over_quota+20].max) < 1)
@@ -2315,7 +2361,7 @@ module URN
 		MARKET_PAIRS_CACHE_T = 6*3600 - 2000
 
 		def record_operation_time
-			@operation_time = DateTime.now
+			@operation_time = Time.now.to_f
 		end
 
 		def last_operation_time
@@ -2411,7 +2457,10 @@ module URN
 
 		def get_active_pair(pair)
 			mkt_lazy_load(pair)
-			if market_type() == :spot
+			if @ftx_market_type_mixed == true # Support both SPOT and FUTURE
+				return contract_name(pair) if is_future?(pair)
+				return pair
+			elsif market_type() == :spot
 				return spot_pair(pair)
 			elsif market_type() == :future
 				return contract_name(pair)
@@ -2437,9 +2486,9 @@ module URN
 					return pair
 				end
 			end
-			raise "Contract missing for #{pair}" if @contract_alias.nil?
+			raise "Contract missing for #{market_name()} #{pair}" if @contract_alias.nil?
 			contract = @contract_alias[pair]
-			raise "Contract missing for #{pair}" if contract.nil?
+			raise "Contract missing for #{market_name()} #{pair}" if contract.nil?
 			contract
 		end
 
@@ -2575,11 +2624,16 @@ module URN
 		# --------------------------------------
 		#
 		def preprocess_deviation_evaluate(pair, opt={})
-			if market_name() == 'FTX' && is_future?(pair) == false && market_type() != :spot
-				ftx_enter_spot_mode()
+			if market_name().start_with?('FTX') && (is_future?(pair) == false) && market_type() != :spot
+				ftx_enter_spot_mode() unless opt[:ftx_switch_spot] == false # Auto switch to SPOT unless specified
 			end
 
-			return preprocess_deviation_evaluate_for_futures(pair, opt) if market_type() == :future
+			quit_mkt = (market_name() == 'HitBTC' || market_name() == 'Polo')
+			if (opt[:ftx_switch_spot] == false) && (is_future?(pair) == false) && market_name().start_with?('FTX')
+				# If pair is not a contract, and ftx_switch_spot is forced to be false, treat it as spot pair
+			elsif market_type() == :future
+				return preprocess_deviation_evaluate_for_futures(pair, opt)
+			end
 			pair = get_active_pair(pair)
 			map = fee_rate_real_evaluate(pair, opt).clone()
 			return nil if map.nil? && opt[:allow_fail] == true
@@ -2590,12 +2644,14 @@ module URN
 			end
 			currency, asset = pair_assets(pair)
 			sell_deviation_adjust = false
-			if can_withdraw?(asset) == false || market_name() == 'HitBTC' # Stop buying in HitBTC
+			asset_dev = high_withdraw_fee_deviation(asset)
+			cash_dev = high_withdraw_fee_deviation(currency)
+			if can_withdraw?(asset) == false || quit_mkt # Stop buying in quit market
 				dev = off_withdraw_fee_deviation(asset)
 				map['maker/buy'] += dev
 				map['taker/buy'] += dev
-			elsif high_withdraw_fee_deviation(asset) != nil
-				dev = high_withdraw_fee_deviation(asset)
+			elsif asset_dev != nil
+				dev = asset_dev
 				map['maker/buy'] += dev
 				map['taker/buy'] += dev
 			elsif can_deposit?(asset) == false
@@ -2605,8 +2661,8 @@ module URN
 				sell_deviation_adjust = true
 			end
 
-			if high_withdraw_fee_deviation(currency) != nil && !sell_deviation_adjust && market_name() != 'HitBTC' # Sell all in HitBTC
-				dev = high_withdraw_fee_deviation(currency)
+			if cash_dev != nil && !sell_deviation_adjust && !quit_mkt # Sell all in quit market
+				dev = cash_dev
 				# Currency has high withdraw fee, add deviation for selling pair.
 				map['maker/sell'] += dev
 				map['taker/sell'] += dev
@@ -2763,7 +2819,7 @@ module URN
 			rate_records = his['rate_apy'] # From latest to oldest
 			rate_records = rate_records.map { |r| r.to_f/100 }
 			funding_hr = nil
-			if market_name() == 'FTX'
+			if market_name().start_with?('FTX')
 				funding_hr = 1
 			elsif market_name() == 'Bybit' || market_name() == 'BybitU'
 				funding_hr = funding_interval_hour(pair)
@@ -2835,9 +2891,17 @@ module URN
 			SATOSHI
 		end
 
+		def max_vol(pair)
+			Float::MAX
+		end
+
 		def min_quantity(pair)
 			pair = get_active_pair(pair)
 			SATOSHI
+		end
+
+		def max_quantity(pair)
+			Float::MAX
 		end
 
 		# Determine smallest order size based on given price.
@@ -2874,7 +2938,7 @@ module URN
         end
 			end
 			vol = min_vol(pair)
-			s = (vol*10000000000).to_f/(price*10000000000).to_f
+			s = ((vol*10000000000).to_f/(price*10000000000).to_f).round(8)
 			# For those market, order size is shown as volume.
 			return s if quantity_in_orderbook() == :vol
 			# Format s as integer times of quantity_step()
@@ -2882,7 +2946,7 @@ module URN
 			raise "#{market_name} quantity_step(#{pair}) is zero" if step <= 0
 			lot = (s/step).ceil
 			adjusted_size = lot * step
-			[adjusted_size, min_quantity(pair)].max
+			[adjusted_size, min_quantity(pair)].max.round(8)
 		end
 
 		# Format order size into integer times of lot.
@@ -3070,6 +3134,8 @@ module URN
 			assets = opt[:assets] # Customized filter
 			s = "Balance [#{head}] - " + market_name()
 			logs.push s
+			balance(allow_fail: true) if @balance_cache.nil?
+			return logs if @balance_cache.nil?
 			keys = @balance_cache.keys.sort
 			if market_type() == :future
 				s = "#{'Bal'.ljust(16)} #{format_num('CASH', 8)} #{format_num("CASH_V", 8)} #{format_num('RESERVED', 8)} #{format_num('PENDING', 4)}"
@@ -3363,7 +3429,7 @@ module URN
 			end
 		end
 
-		def pre_place_order(pair, order)
+		def pre_place_order(pair, order, opt={})
 			return false if is_banned?()
 			pair = get_active_pair(pair)
 			# Last minute check.
@@ -3726,7 +3792,32 @@ module URN
 				puts "OMS disabled".red # Warn mildly.
 				return nil
 			end
-			return oms_scan_orders_by_pair(pair, mode, opt) if pair != nil
+
+			# Get orders direct from memory cache, when pair is nil.
+			# Too much time used in hgetall for every pair.
+			if URN::OMSLocalCache.support_mkt?(market_name()) && pair.nil?
+				all_orders = URN::OMSLocalCache.oms_orders(market_name()).uniq
+				num = all_orders.size
+				puts "<< OMS local cache #{num} orders"
+				all_orders = all_orders.map { |o| _normalize_trade(nil, JSON.parse(o)) }
+        if mode == :active
+					all_orders = all_orders.select { |o| order_alive?(o) }.uniq
+				else
+					all_orders = all_orders.uniq
+				end
+				puts "<< OMS local cache #{pair} #{all_orders.size}/#{num} #{mode} orders"
+				return all_orders
+			end
+
+			if pair.is_a?(Array)
+				orders = []
+				pair.each { |p|
+					orders += oms_scan_orders_by_pair(p, mode, opt)
+				}
+				return orders
+			elsif pair != nil
+				return oms_scan_orders_by_pair(pair, mode, opt)
+			end
 			verbose = @verbose && opt[:verbose] != false
 			# Get all pairs then all orders
 			prefix = "URANUS:#{market_name()}:#{account_name()}:O:"
@@ -3765,7 +3856,7 @@ module URN
         else
           next true
         end
-      } .uniq { |o| o['i'] }
+      }.uniq { |o| o['i'] }
       if verbose
         if mode == :active
           puts "<< OMS #{pair} #{latest_orders.size}/#{order_map.size} alive orders"
@@ -4134,7 +4225,7 @@ module URN
           trade['executed'] > 0,
           order_age(order) < 360_000,
           order['p'] != nil,
-          (order['executed'] || 0) < trade['executed'],
+          (order['executed'] || 0) <= trade['executed'],
           (order['T'] || trade['T']) == trade['T'],
           (order['s'] || trade['s']) == trade['s']
         ]
@@ -4299,7 +4390,7 @@ module URN
 		# Cancel all related orders to prepare enough balance.
 		def prepare_enough_balance(asset, amount, opt={})
 			from_mkt = market_name()
-			ftx_enter_spot_mode() if from_mkt == 'FTX'
+			ftx_enter_spot_mode() if from_mkt.start_with?('FTX')
 			asset = asset.upcase
 			opt[:allow_fail] = true if opt[:allow_fail].nil? # This is not a critical action
 
@@ -4357,7 +4448,15 @@ module URN
 				end
 
 				if command != nil
-					endless_retry(sleep:1) { redis().set("URANUS:command", command) }
+					puts "cancel all related orders after 20 seconds with command #{command}"
+					ret = get_input prompt:"Press enter to skip sending command in 20s", timeout: 20
+					if ret.nil?
+						endless_retry(sleep:1) { redis().set("URANUS:command", command) }
+					else
+						puts "The command execution is aborted".red
+						keep_sleep 2
+						return
+					end
 				end
 				start_t = Time.now
 				loop {
@@ -4421,7 +4520,10 @@ module URN
 		end
 
 		def margin_status(opt={})
-			balance() if @balance_cache.nil?
+			if @balance_cache.nil?
+				ret = balance(opt)
+				return nil if ret.nil? && opt[:allow_fail] == true
+			end
 
 			all_assets = []
 			if opt[:asset].nil?
@@ -4438,14 +4540,14 @@ module URN
 			all_assets.each { |asset|
 				margin_wallet_cash = @balance_cache.dig(asset, 'cash') || 0
 				margin_wallet_pnl = @balance_cache.dig(asset, 'pending') || 0
-				if market_name() == 'FTX' && margin_wallet_pnl > 0
+				if market_name().start_with?('FTX') && margin_wallet_pnl > 0
 					margin_wallet_pnl = 0 # FTX lending balance is in PnL too
 				else
 					margin_wallet_pnl = @balance_cache.dig(asset, 'pending') || 0
 				end
 				margin_wallet_bal = margin_wallet_cash + margin_wallet_pnl
 				# For FTX, use USD * 10 as max of margin_wallet_bal
-				if market_name() == 'FTX' && asset == 'FTX_COLLATERAL'
+				if market_name().start_with?('FTX') && asset == 'FTX_COLLATERAL'
 					usd_wallet_cash = @balance_cache.dig('USD', 'cash') || 0
 					if usd_wallet_cash > 0
 						margin_wallet_bal = [margin_wallet_bal, usd_wallet_cash*10].min
@@ -4554,7 +4656,7 @@ module URN
 					}
 				end
 
-				if r['asset'] == 'USDT' || r['asset'] == 'FTX_COLLATERAL'
+				if r['asset'] == 'USDT' || r['asset'] == 'FTX_COLLATERAL' || r['asset'] == 'BNUM_COLLATERAL'
 					line = [
 						(name_in_separate_line ? 'ALL' : name).rjust(max_name_in_line_length),
 						rough_num(r['risk_balance']).to_s.rjust(7),
@@ -4644,6 +4746,45 @@ module URN
 			balance_cache_print()
 		end
 
+		# Read exists tasks from tmux_uranus.sh and give suggestion
+		def rearrange_spider_tasks
+			self.class.class_eval {
+				include URN::TraderStatusUtil
+			}
+			puts "Read spider task from bin/tmux_uranus.sh"
+			tasks_by_pair = active_spider_tasks()
+			tasks = {}
+			tasks_by_pair.each { |pair, mkts|
+				tasks[pair] = true if mkts[market_name().upcase] == true
+			}
+			supported_pairs = all_pairs().keys
+			add_ct = 0
+			tasks.keys.each { |pair|
+				quote, asset = pair.split('-')
+				candidates = []
+				if pair =~ /USD/
+					candidates = ["USDT-#{asset}", "USD-#{asset}"]
+				end
+				candidates.each { |p2|
+					if supported_pairs.include?(p2)
+						underlied_p = pair_to_underlying_pair(p2)
+						if tasks[p2].nil?
+							puts "Add #{p2} -> #{underlied_p}"
+							add_ct += 1
+							tasks[p2] = true
+						end
+					end
+				}
+			}
+			spider_tasks = tasks.keys.map { |p| pair_to_underlying_pair(p).downcase }.sort
+			spider_tasks = spider_tasks.map { |p|
+				p = p.split('-')[1] if p =~ /^btc-/ # btc-1inch -> 1inch
+				next p
+			}
+			puts "Suggest pairs after #{add_ct} added"
+			puts spider_tasks.join(' ')
+		end
+
 		def test_trading_process()
 			pair = nil
 			order_args = nil
@@ -4683,11 +4824,11 @@ module URN
 			elsif market_name() == 'Coinbase'
 				pair = 'BTC-BCH'
 				pair = determine_pair(pair)
-				order_args = {'pair'=>pair,'p'=>0.003,'s'=>0.1,'T'=>'buy'}
-			elsif market_name() == 'FTX'
+				order_args = {'pair'=>pair,'p'=>0.001,'s'=>0.1,'T'=>'buy'}
+			elsif market_name().start_with?('FTX')
 				pair = 'USD-ADA@P'
 				pair = determine_pair(pair)
-				order_args = {'pair'=>pair,'p'=>0.3, 's'=>10,'T'=>'buy'}
+				order_args = {'pair'=>pair,'p'=>0.1, 's'=>10,'T'=>'buy'}
       elsif @_is_ib == true
         # Special test target configuration for IB based markets.
         base_pair = nil
@@ -4964,8 +5105,15 @@ module URN
 				margin_status_desc(asset: args[1], length: 80).each { |l| puts l }
 				return
 			elsif args[0] == 'pairs'
-				msg = all_pairs().to_a.sort.to_h
-				puts JSON.pretty_generate(msg)
+				pair_map = all_pairs()
+				if args[1].nil?
+					msg = pair_map.keys.sort
+				else
+					msg = pair_map.keys.select { |p| p.split('-').include?(args[1].upcase) }.sort
+				end
+				msg.each { |p|
+					puts [p.ljust(16), pair_map[p]]
+				}
 				return
 			elsif args[0] == 'ban?'
 				puts "#{self.class.name}\nbanned?:#{is_banned?()}\nbanned util #{banned_util()}, reason: #{banned_reason()}"
@@ -4996,6 +5144,10 @@ module URN
 			elsif args[0] == 't'
 				puts 'Fast test()'
 				test()
+				return
+			elsif args[0] == 'spider'
+				puts 'rearrange_spider_tasks()'
+				rearrange_spider_tasks()
 				return
 			elsif args[0] == 'test'
 				balance()
@@ -5183,9 +5335,9 @@ module URN
 						end
 					end
 					['buy', 'sell'].each do |side|
-						if market_type() == :spot
+						if market_type() == :spot || (@ftx_market_type_mixed && !is_future?(pair))
 							order = {'pair'=>pair, 'T'=>side, 'p'=>1.0}
-							size = max_order_size(order, verbose:true)
+							size = max_order_size(order, clear_bal: true, verbose:true)
 							puts [pair, "max_order_size(#{side}) when price=1", size].to_s.blue
 						elsif market_type() == :future
 							v = future_available_cash(pair, side, verbose:true)
@@ -5208,7 +5360,7 @@ module URN
 				test_balance_with_all_orders(pair)
 				return
 			elsif pair != nil && args[1] == 'fee'
-				ftx_enter_spot_mode() if market_name() == 'FTX'
+				ftx_enter_spot_mode() if market_name().start_with?('FTX')
 				# client.rb usdt-btc fee
 				puts self.class.name
 				fee_rate_real_evaluate(pair)
@@ -5383,7 +5535,7 @@ module URN
 						end
 						puts "will cancel #{t['i']}:\n#{format_trade(t)}"
 					end
-					input = get_input prompt:"Press Y to cancel all [#{args[3]}] orders"
+					input = get_input prompt:"Press Y to cancel all type[#{args[3]}] [#{target_orders.size}] orders"
 					raise "Abort canceling order" unless input.downcase.strip == 'y'
 					canceled_orders = []
 					loop do
@@ -5428,10 +5580,11 @@ module URN
 				order_args['v'] = order_args.delete('s') if quantity_in_orderbook() == :vol
 				tif = nil
 				tif = 'PO' if args.include?('po')
+				reduce_only = true if args.include?('ro')
 				loop do
-					input = get_input prompt:"Press Y to confirm #{pair} #{tif} order\n#{format_trade(order_args)}"
+					input = get_input prompt:"Press Y to confirm #{pair} TIF #{tif} RO #{reduce_only} order\n#{format_trade(order_args)}"
 					raise "Abort placing order" unless input.downcase.strip == 'y'
-					order = place_order pair, order_args, notag:true, tif: tif
+					order = place_order pair, order_args, notag:true, tif: tif, reduce_only: reduce_only
 					puts JSON.pretty_generate(order)
 					puts "Order placed #{order['i']}:\n#{format_trade(order)}"
 					# Keep querying order status.
@@ -5942,14 +6095,21 @@ module URN
 			scan_buy_now = true
 			balance_limited, vol_max_reached, vol_min_limited = false, false, false
 			loop_ct = 0
-			loop do
+			loop {
 				loop_ct += 1
-				if loop_ct > 9999
+				if loop_ct > 999
 					# Bug #1 triggerred.
-					debug_info = [nil, nil, nil, min_price_diff, opt, odbk_bid, odbk_ask]
-					file_name = "#{URN::ROOT}/debug_#1_#{DateTime.now.strftime('%Y%m%d_%H%M%S')}.json"
-					File.open(file_name, 'w') { |f| f.write(JSON.pretty_generate(debug_info)) }
-					puts "Bug 1 triggerred, debug info flushed -> #{file_name}"
+          opt_clone = opt.clone
+          opt_clone[:market_bid] = market_bid
+          opt_clone[:market_ask] = market_ask
+					debug_info = [nil, nil, nil, min_price_diff, opt_clone, odbk_bid, odbk_ask]
+          if opt[:debug] != true
+            file_name = "#{URN::ROOT}/debug_#1_#{DateTime.now.strftime('%Y%m%d_%H%M%S')}.json"
+            File.open(file_name, 'w') { |f| f.write(JSON.pretty_generate(debug_info)) }
+            puts "Bug 1 triggerred, debug info flushed -> #{file_name}"
+          else
+            puts "Bug 1 triggerred, dont save again in debug mode"
+          end
 					return {
 						:logs=>[logs, scan_status, [], min_price_diff, opt, odbk_bid[0..20], odbk_ask[0..20]]
 					}
@@ -5968,9 +6128,7 @@ module URN
 					break
 				end
 
-				if scan_status[opposite_type]['finished'] &&
-					idx >= odbk.size
-
+				if scan_status[opposite_type]['finished'] && idx >= odbk.size
 					puts "#{opposite_type} side is already finished, all #{type} data is scanned, all finished." if verbose
 					log.push "#{opposite_type} side is already finished, all #{type} data is scanned, all finished." if remote_debug
 					scan_status[type]['finished'] = true
@@ -5980,6 +6138,9 @@ module URN
 				# Scan other side if this side is marked as finished.
 				# Scan other side if this orderbook is all checked.
 				if scan_status[type]['finished'] || idx >= odbk.size
+          puts "-> flip to #{opposite_type}"
+          logs.push "-> flip to #{opposite_type}"
+					scan_status[type]['finished'] = true
 					scan_buy_now = !scan_buy_now
 					next
 				end
@@ -6070,7 +6231,7 @@ module URN
 				# Compare future size_sum with opposite_s, if this side is fewer, continue scan.
 				next if size_sum < opposite_s
 				scan_buy_now = !scan_buy_now
-			end
+			}
 
 			# Return if no suitable orders.
 			if scan_status['buy']['idx'] == 0 || scan_status['sell']['idx'] == 0
@@ -6138,6 +6299,19 @@ module URN
 				:size_min_limited => size_min_limited,
 				:logs		=> [logs, scan_status, orders, min_price_diff, opt, odbk_bid[0..20], odbk_ask[0..20]]
 			}
+		end
+
+		# Given different market clients that size in asset, omit vol based market
+		# Format/shrink size according to market rules.
+		# But this method might break min_vol or min_quantity in some markets.
+		# Do size detection after using this.
+		def downgrade_order_size_for_all_market(order, clients)
+			size = clients.map { |c|
+				next nil if c.quantity_in_orderbook() != :asset
+				next c.format_size(order)
+			}.select { |s| s != nil }.min
+			order['s'] = size if size != nil
+			order
 		end
 
 		# Given orders with different market clients.
@@ -6358,7 +6532,7 @@ module URN
 				snapshot[client.given_name][pair] ||= {}
 				snapshot[client.given_name][pair][:orderbook] = odbk
 				bids, asks, t, mkt_t = odbk
-				t = mkt_t if mkt_t != nil
+				# t = mkt_t if mkt_t != nil # Use spider local t is better than mkt_t
 				# Abort if timestamp is too old compared to system timestamp.
 				abort_reason = nil
 				gap = now - t.to_i
@@ -6372,13 +6546,13 @@ module URN
 					end
 					next
 				end
-				# Check market timestamp with latest market_client timestamp.
-				time_legacy = client.last_operation_time.strftime('%Q').to_i - t
-				if time_legacy >= 5
+				# Check market timestamp latency, warn only, market time has ~50ms noise.
+				time_legacy = client.last_operation_time.to_i - (mkt_t || t)
+				if time_legacy >= 50 && time_legacy < 1200_000
 					@_mkt_data_slow_warning[m] ||= 0
 					if now - @_mkt_data_slow_warning[m] >= 200
 						@_mkt_data_slow_warning[m] = now
-						puts "#{m} #{pair} orderbook is #{time_legacy.round}ms old"
+						puts "#{m} #{pair} orderbook is #{time_legacy.round}ms older than last_operation_time"
 					end
 					next
 				end
@@ -6521,7 +6695,7 @@ module URN
 					next
 				end
 				# Check market timestamp with latest market_client timestamp.
-				time_legacy = client.last_operation_time.strftime('%Q').to_i - t
+				time_legacy = client.last_operation_time.to_i - t
 				if time_legacy >= 0
 					puts "#{market} trade history is #{time_legacy}ms old"
 					next
@@ -6656,20 +6830,29 @@ if __FILE__ == $0 && defined? URN::BOOTSTRAP_LOAD
 		puts JSON.pretty_generate(r)
 		exit
 	elsif ARGV[0] == 'test2'
-		URN::TRADE_MARKETS_DUPACCOUNT.each do |m|
-			client_register URN.const_get(m).new(verbose:true, skip_balance:true, trade_mode:'test')
-		end
 		puts "Market client testing aggressive_arbitrage_orders ..."
-		test_file = "./test_input/aggressive_arbitrage_orders/#{ARGV[1]}.json"
-		raise "Input #{test_file} is not found" unless File.file? test_file
+		test_file = [
+      "./test_input/aggressive_arbitrage_orders/#{ARGV[1]}.json",
+      "./test_input/aggressive_arbitrage_orders/#{ARGV[1]}",
+      ARGV[1]
+    ].select { |p| File.file?(p) }.first
+    raise "Input #{test_file} is not found" if test_file.nil?
+    puts "Loading #{test_file}"
 		json = JSON.parse(File.read(test_file))
 		min_price_diff, opt, odbk_bid, odbk_ask = json[3..6]
 		opt = opt.to_a.map { |kv| [kv[0].to_sym, kv[1]] }.to_h
 		opt[:verbose] = true
-		pair = 'BTC-BAT'
-		_preprocess_orderbook(pair, [odbk_bid, [], nil], URN.const_get(opt[:market_bid]).new(verbose:true, skip_balance:true))
-		_preprocess_orderbook(pair, [[], odbk_ask, nil], URN.const_get(opt[:market_ask]).new(verbose:true, skip_balance:true))
+		pair = opt[:pair] || 'BTC-BAT'
+    include URN::TradeUtil
+    include URN::MarketData
+		opt[:mkt_client_bid] = client_bid = URN.const_get(opt[:market_bid] || opt[:mkt_client_bid]).new(verbose:true, skip_balance:true)
+    client_bid.preprocess_deviation_evaluate(pair)
+    opt[:mkt_client_ask] = client_ask = URN.const_get(opt[:market_ask] || opt[:mkt_client_ask]).new(verbose:true, skip_balance:true)
+    client_ask.preprocess_deviation_evaluate(pair)
+		_preprocess_orderbook(pair, [odbk_bid, [], nil], client_bid)
+		_preprocess_orderbook(pair, [[], odbk_ask, nil], client_ask)
 		opt[:use_real_price] = true
+		opt[:debug] = true
 		puts opt
 		r = aggressive_arbitrage_orders odbk_bid, odbk_ask, min_price_diff, opt
 		r.delete :logs
